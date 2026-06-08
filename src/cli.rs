@@ -14,6 +14,10 @@ pub enum Commands {
     Review {
         /// Path to the repository.
         path: PathBuf,
+
+        /// Optional path to a review configuration file.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Check whether common developer tools are installed and usable.

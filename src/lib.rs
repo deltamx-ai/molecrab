@@ -4,7 +4,7 @@ pub mod core;
 
 use clap::Parser;
 
-pub fn run() {
+pub fn run() -> i32 {
     let cli = cli::Cli::parse();
-    app::run(cli.command);
+    app::run(cli.command)
 }

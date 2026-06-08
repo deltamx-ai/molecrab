@@ -1,3 +1,3 @@
 fn main() {
-    molecrab::run();
+    std::process::exit(molecrab::run());
 }

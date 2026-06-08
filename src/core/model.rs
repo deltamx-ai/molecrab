@@ -1,6 +1,6 @@
 use super::config::ReviewConfig;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FileSnapshot {
     pub path: String,
     pub name: String,
@@ -11,7 +11,7 @@ pub struct FileSnapshot {
     pub content: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FunctionSnapshot {
     pub file: String,
     pub name: String,
@@ -20,28 +20,28 @@ pub struct FunctionSnapshot {
     pub lines: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RepositoryProfile {
-    path: String,
-    file_count: usize,
-    source_file_count: usize,
-    test_file_count: usize,
-    total_lines: usize,
+    pub path: String,
+    pub file_count: usize,
+    pub source_file_count: usize,
+    pub test_file_count: usize,
+    pub total_lines: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GitAuthorStat {
     pub name: String,
     pub commits: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GitHotspot {
     pub path: String,
     pub commits: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GitSnapshot {
     pub total_commits: u32,
     pub contributor_count: usize,
@@ -51,7 +51,7 @@ pub struct GitSnapshot {
     pub hotspots: Vec<GitHotspot>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RepositorySnapshot {
     pub profile: RepositoryProfile,
     pub files: Vec<FileSnapshot>,
@@ -59,14 +59,14 @@ pub struct RepositorySnapshot {
     pub git: Option<GitSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Severity {
     Info,
     Warning,
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Finding {
     pub severity: Severity,
     pub file: Option<String>,
@@ -75,7 +75,7 @@ pub struct Finding {
     pub suggestion: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricResult {
     pub name: &'static str,
     pub weight: u8,
@@ -83,7 +83,7 @@ pub struct MetricResult {
     pub findings: Vec<Finding>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ReviewReport {
     pub profile: RepositoryProfile,
     pub config: ReviewConfig,
@@ -96,7 +96,7 @@ pub struct ReviewReport {
     pub git: Option<GitSnapshot>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FileRanking {
     pub path: String,
     pub name: String,
@@ -104,7 +104,7 @@ pub struct FileRanking {
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FunctionRanking {
     pub file: String,
     pub name: String,

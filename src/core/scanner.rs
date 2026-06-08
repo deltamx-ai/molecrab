@@ -191,8 +191,12 @@ fn find_function_end(lines: &[&str], start: usize) -> Option<usize> {
 }
 
 fn collect_git_snapshot(root: &Path) -> Option<GitSnapshot> {
-    let total_commits = run_git_count(root, &["rev-list", "--count", "HEAD"])?;
-    let authors = run_git_lines(root, &["shortlog", "-sne", "--all", "--no-merges", "HEAD"])?;
+    if !is_git_repo(root) {
+        return None;
+    }
+
+    let total_commits = run_git_count(root, &["rev-list", "--count", "HEAD"]);
+    let authors = run_git_lines(root, &["shortlog", "-sne", "--all", "--no-merges", "HEAD"]);
     let recent_authors = run_git_lines(
         root,
         &[
@@ -203,8 +207,13 @@ fn collect_git_snapshot(root: &Path) -> Option<GitSnapshot> {
             "--since=30.days",
             "HEAD",
         ],
-    )?;
-    let hotspots = run_git_lines(root, &["log", "--name-only", "--pretty=format:", "--all"])?;
+    );
+    let hotspots = run_git_lines(root, &["log", "--name-only", "--pretty=format:", "--all"]);
+
+    let total_commits = total_commits?;
+    let authors = authors.unwrap_or_default();
+    let recent_authors = recent_authors.unwrap_or_default();
+    let hotspots = hotspots.unwrap_or_default();
 
     let mut author_stats = parse_author_stats(authors);
     let recent_active_authors = parse_author_stats(recent_authors);
@@ -228,6 +237,13 @@ fn collect_git_snapshot(root: &Path) -> Option<GitSnapshot> {
         author_commit_counts: author_stats,
         hotspots: hotspot_stats,
     })
+}
+
+fn is_git_repo(root: &Path) -> bool {
+    run_git_output(root, &["rev-parse", "--is-inside-work-tree"])
+        .as_deref()
+        .map(str::trim)
+        == Some("true")
 }
 
 fn run_git_count(root: &Path, args: &[&str]) -> Option<u32> {

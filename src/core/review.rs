@@ -2,6 +2,9 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use colored::Colorize;
+use serde::Serialize;
+
+use crate::cli::OutputFormat;
 
 use super::config::ReviewConfig;
 use super::metrics;
@@ -10,10 +13,19 @@ use super::model::{
 };
 use super::scanner;
 
-pub fn run(path: PathBuf, config_path: Option<PathBuf>) -> i32 {
+pub fn run(path: PathBuf, config_path: Option<PathBuf>, format: OutputFormat) -> i32 {
     match analyze(path, config_path) {
         Ok(report) => {
-            println!("{}", render_report(&report));
+            match format {
+                OutputFormat::Text => println!("{}", render_text_report(&report)),
+                OutputFormat::Json => match render_json_report(&report) {
+                    Ok(json) => println!("{}", json),
+                    Err(err) => {
+                        eprintln!("review failed: {}", err.red());
+                        return 1;
+                    }
+                },
+            }
             0
         }
         Err(err) => {
@@ -145,42 +157,74 @@ fn rank_functions(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Vec<F
     functions
 }
 
-fn render_report(report: &ReviewReport) -> String {
+fn render_text_report(report: &ReviewReport) -> String {
     let mut out = String::new();
 
     render_header(&mut out, report);
     render_overview(&mut out, report);
-    render_metrics(&mut out, report);
     render_observability(&mut out, report);
     render_findings(&mut out, report);
+    render_score_breakdown(&mut out, report);
 
     out
 }
 
+fn render_json_report(report: &ReviewReport) -> Result<String, String> {
+    let output = JsonReviewReport::from_report(report);
+    serde_json::to_string_pretty(&output)
+        .map_err(|err| format!("failed to render json report: {}", err))
+}
+
 fn render_header(out: &mut String, report: &ReviewReport) {
-    let mut line = String::new();
-    let status = match report.grade.as_str() {
-        "A" | "B" => "healthy".green(),
-        "C" => "okay".yellow(),
-        _ => "needs work".red(),
-    };
+    let verdict = verdict_for_grade(&report.grade);
+    let status = verdict_status(&report.grade);
 
     let _ = writeln!(out, "{}", "molecrab review".bold().cyan());
     let _ = writeln!(out, "{}", "================".cyan());
     let _ = writeln!(out);
+    let _ = writeln!(out, "Summary");
+    let _ = writeln!(out, "-------");
+    let _ = writeln!(out, "{}", summary_line(report, verdict, status));
+    let _ = writeln!(out, "- Path: {}", report.profile.path());
     let _ = writeln!(
-        line,
-        "Status: {}  Grade: {}  Score: {}/100",
-        status,
-        report.grade.bold(),
-        report.overall
+        out,
+        "- Scope: {} files, {} source files, {} test files, {} total lines",
+        report.profile.file_count(),
+        report.profile.source_file_count(),
+        report.profile.test_file_count(),
+        report.profile.total_lines()
     );
-    let _ = writeln!(out, "{}", line);
+    let _ = writeln!(out);
+}
+
+fn summary_line(report: &ReviewReport, verdict: &str, status: &str) -> String {
+    format!(
+        "Score {}/100 · Grade {} · {}",
+        report.overall,
+        report.grade.bold(),
+        format!("{} ({})", verdict, status).bold()
+    )
+}
+
+fn verdict_for_grade(grade: &str) -> &'static str {
+    match grade {
+        "A" | "B" => "healthy",
+        "C" => "serviceable",
+        _ => "needs attention",
+    }
+}
+
+fn verdict_status(grade: &str) -> &'static str {
+    match grade {
+        "A" | "B" => "good shape",
+        "C" => "watch closely",
+        _ => "follow up",
+    }
 }
 
 fn render_overview(out: &mut String, report: &ReviewReport) {
     section(out, "Overview");
-    kv(out, "Path", report.profile.path());
+    kv(out, "Repository", report.profile.path());
     kv(out, "Files", report.profile.file_count().to_string());
     kv(
         out,
@@ -193,31 +237,46 @@ fn render_overview(out: &mut String, report: &ReviewReport) {
         report.profile.test_file_count().to_string(),
     );
     kv(out, "Total lines", report.profile.total_lines().to_string());
-    kv(
-        out,
-        "Configured floor",
-        format!("{} / 100", report.config.thresholds.overall_score),
-    );
-    kv(
-        out,
-        "Observability weight",
-        report.config.thresholds.observability_weight.to_string(),
-    );
-    let enabled_targets = report.config.enabled_observability_targets();
-    kv(
-        out,
-        "Observability enabled",
-        if enabled_targets.is_empty() {
-            "none".to_string()
-        } else {
-            enabled_targets.join(", ")
-        },
-    );
     out.push('\n');
 }
 
-fn render_metrics(out: &mut String, report: &ReviewReport) {
-    section(out, "Metrics");
+fn render_observability(out: &mut String, report: &ReviewReport) {
+    section(out, "Observability");
+    let _ = writeln!(
+        out,
+        "These are factual snapshots from the repository and its git history, not score inputs."
+    );
+    let _ = writeln!(out);
+
+    render_file_observability(out, report);
+    render_function_observability(out, report);
+    render_git_observability(out, report);
+    out.push('\n');
+}
+
+fn render_findings(out: &mut String, report: &ReviewReport) {
+    section(out, "Findings");
+    let _ = writeln!(
+        out,
+        "These are the review judgments derived from the metrics above."
+    );
+    let _ = writeln!(out);
+
+    if report.findings.is_empty() {
+        let _ = writeln!(out, "- no major issues found");
+        out.push('\n');
+        return;
+    }
+
+    let grouped = grouped_findings(&report.findings);
+
+    render_finding_group(out, "Errors", &grouped.errors);
+    render_finding_group(out, "Warnings", &grouped.warnings);
+    render_finding_group(out, "Info", &grouped.info);
+}
+
+fn render_score_breakdown(out: &mut String, report: &ReviewReport) {
+    section(out, "Score breakdown");
     for metric in &report.metrics {
         let label = metric_label(metric.score);
         let _ = writeln!(
@@ -229,44 +288,22 @@ fn render_metrics(out: &mut String, report: &ReviewReport) {
     out.push('\n');
 }
 
-fn render_observability(out: &mut String, report: &ReviewReport) {
-    section(out, "Observability");
-    render_file_observability(out, report);
-    render_function_observability(out, report);
-    render_git_observability(out, report);
-    out.push('\n');
-}
-
-fn render_findings(out: &mut String, report: &ReviewReport) {
-    section(out, "Top findings");
-    if report.findings.is_empty() {
-        let _ = writeln!(out, "- no major issues found");
+fn render_finding_group(out: &mut String, title: &str, items: &[&Finding]) {
+    if items.is_empty() {
         return;
     }
-
-    let mut grouped = grouped_findings(&report.findings);
-
-    for (title, items) in [
-        ("Errors", &mut grouped.errors),
-        ("Warnings", &mut grouped.warnings),
-        ("Info", &mut grouped.info),
-    ] {
-        if items.is_empty() {
-            continue;
-        }
-        let _ = writeln!(out, "{}", title.bold());
-        for finding in items.iter().take(5) {
-            let severity = finding.severity_label();
-            let location = finding
-                .file
-                .as_deref()
-                .map(|file| format!("{}: ", file))
-                .unwrap_or_default();
-            let _ = writeln!(out, "- [{}] {}{}", severity, location, finding.message);
-            let _ = writeln!(out, "  -> {}", finding.suggestion);
-        }
-        out.push('\n');
+    let _ = writeln!(out, "{}", title.bold());
+    for finding in items.iter().take(5) {
+        let severity = finding.severity_label();
+        let location = finding
+            .file
+            .as_deref()
+            .map(|file| format!("{}: ", file))
+            .unwrap_or_default();
+        let _ = writeln!(out, "- [{}] {}{}", severity, location, finding.message);
+        let _ = writeln!(out, "  -> {}", finding.suggestion);
     }
+    out.push('\n');
 }
 
 fn render_file_observability(out: &mut String, report: &ReviewReport) {
@@ -275,28 +312,30 @@ fn render_file_observability(out: &mut String, report: &ReviewReport) {
         return;
     }
 
-    section(out, "File observability");
+    section(out, "File snapshot");
     if report.file_rankings.is_empty() {
         let _ = writeln!(out, "- no file ranking available");
+        out.push('\n');
         return;
     }
 
     for file in &report.file_rankings {
         let mut parts = Vec::new();
         if config.file_names {
-            parts.push(format!("name: {}", file.name));
+            parts.push(file.name.to_string());
         }
         if config.file_paths {
-            parts.push(format!("path: {}", file.path));
+            parts.push(format!("path {}", file.path));
         }
         if config.file_line_counts {
-            parts.push(format!("lines: {}", file.lines));
+            parts.push(format!("{} lines", file.lines));
         }
         if config.file_sizes {
-            parts.push(format!("bytes: {}", file.bytes));
+            parts.push(format!("{} bytes", file.bytes));
         }
-        let _ = writeln!(out, "- {}", parts.join(" | "));
+        let _ = writeln!(out, "- {}", parts.join(" · "));
     }
+    out.push('\n');
 }
 
 fn render_function_observability(out: &mut String, report: &ReviewReport) {
@@ -304,19 +343,21 @@ fn render_function_observability(out: &mut String, report: &ReviewReport) {
         return;
     }
 
-    section(out, "Function observability");
+    section(out, "Function snapshot");
     if report.function_rankings.is_empty() {
         let _ = writeln!(out, "- no function snapshot available");
+        out.push('\n');
         return;
     }
 
     for func in &report.function_rankings {
         let _ = writeln!(
             out,
-            "- {} :: {} ({} lines, {}-{})",
+            "- {} :: {} — {} lines ({}-{})",
             func.file, func.name, func.lines, func.start_line, func.end_line
         );
     }
+    out.push('\n');
 }
 
 fn render_git_observability(out: &mut String, report: &ReviewReport) {
@@ -331,45 +372,56 @@ fn render_git_observability(out: &mut String, report: &ReviewReport) {
         return;
     }
 
-    section(out, "Git observability");
-    if let Some(git) = &report.git {
-        if config.total_commit_count {
-            kv(out, "Total commits", git.total_commits.to_string());
+    section(out, "Git snapshot");
+    match &report.git {
+        Some(git) => {
+            if config.total_commit_count {
+                kv(out, "Total commits", git.total_commits.to_string());
+            }
+            if config.contributor_count {
+                let contributor_text = format!(
+                    "{} contributors contributed commits here",
+                    git.contributor_count
+                );
+                kv(out, "Contributors", contributor_text);
+            }
+            if config.commit_concentration {
+                let concentration_text = format!(
+                    "top 3 authors account for {:.0}% of commits; higher means ownership is more concentrated",
+                    git.commit_concentration * 100.0
+                );
+                kv(out, "Commit concentration", concentration_text);
+            }
+            if config.most_recent_active_authors {
+                bullet_list(
+                    out,
+                    "Recently active authors",
+                    &git.recent_active_authors,
+                    |a| format!("{} ({} commits in the recent window)", a.name, a.commits),
+                );
+            }
+            if config.per_author_commit_counts {
+                bullet_list(
+                    out,
+                    "Per-author commit counts",
+                    &git.author_commit_counts,
+                    |a| format!("{} ({} commits)", a.name, a.commits),
+                );
+            }
+            if config.code_change_hotspots {
+                bullet_list(out, "Code change hotspots", &git.hotspots, |h| {
+                    format!(
+                        "{} (changed {} times; worth extra attention in review)",
+                        h.path, h.commits
+                    )
+                });
+            }
         }
-        if config.contributor_count {
-            kv(out, "Contributor count", git.contributor_count.to_string());
+        None => {
+            let _ = writeln!(out, "- git data unavailable");
         }
-        if config.commit_concentration {
-            kv(
-                out,
-                "Commit concentration",
-                format!("{:.2}", git.commit_concentration),
-            );
-        }
-        if config.most_recent_active_authors {
-            bullet_list(
-                out,
-                "Most recent active authors",
-                &git.recent_active_authors,
-                |a| format!("{} ({})", a.name, a.commits),
-            );
-        }
-        if config.per_author_commit_counts {
-            bullet_list(
-                out,
-                "Per-author commit counts",
-                &git.author_commit_counts,
-                |a| format!("{} ({})", a.name, a.commits),
-            );
-        }
-        if config.code_change_hotspots {
-            bullet_list(out, "Code change hotspots", &git.hotspots, |h| {
-                format!("{} ({})", h.path, h.commits)
-            });
-        }
-    } else {
-        let _ = writeln!(out, "- git data unavailable");
     }
+    out.push('\n');
 }
 
 fn metric_label(score: u8) -> String {
@@ -438,6 +490,52 @@ impl FindingExt for Finding {
             Severity::Info => "INFO".blue().to_string(),
             Severity::Warning => "WARN".yellow().to_string(),
             Severity::Error => "ERROR".red().to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct JsonReviewReport {
+    summary: JsonSummary,
+    repository: super::model::RepositoryProfile,
+    metrics: Vec<super::model::MetricResult>,
+    findings: Vec<super::model::Finding>,
+    observability: JsonObservability,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct JsonSummary {
+    score: u8,
+    grade: String,
+    verdict: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct JsonObservability {
+    file_rankings: Vec<FileRanking>,
+    function_rankings: Vec<FunctionRanking>,
+    git: Option<super::model::GitSnapshot>,
+}
+
+impl JsonReviewReport {
+    fn from_report(report: &ReviewReport) -> Self {
+        Self {
+            summary: JsonSummary {
+                score: report.overall,
+                grade: report.grade.clone(),
+                verdict: verdict_for_grade(&report.grade).to_string(),
+            },
+            repository: report.profile.clone(),
+            metrics: report.metrics.clone(),
+            findings: report.findings.clone(),
+            observability: JsonObservability {
+                file_rankings: report.file_rankings.clone(),
+                function_rankings: report.function_rankings.clone(),
+                git: report.git.clone(),
+            },
         }
     }
 }

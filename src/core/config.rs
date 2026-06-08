@@ -41,14 +41,14 @@ use std::path::{Path, PathBuf};
 /// most_recent_active_authors = true
 /// code_change_hotspots = true
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
 #[serde(default)]
 pub struct ReviewConfig {
     pub thresholds: ReviewThresholds,
     pub observability: ObservabilityTargets,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ReviewThresholds {
     pub overall_score: u8,
@@ -68,7 +68,7 @@ pub struct ReviewThresholds {
     pub top_function_rankings: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ObservabilityTargets {
     pub file_names: bool,

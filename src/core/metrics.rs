@@ -14,7 +14,6 @@ pub fn builtin_metrics() -> Vec<Box<dyn Metric>> {
         Box::new(RobustnessMetric),
         Box::new(PerformanceMetric),
         Box::new(TestabilityMetric),
-        Box::new(ObservabilityMetric),
     ]
 }
 
@@ -30,7 +29,6 @@ struct MaintainabilityMetric;
 struct RobustnessMetric;
 struct PerformanceMetric;
 struct TestabilityMetric;
-struct ObservabilityMetric;
 
 impl Metric for ReadabilityMetric {
     fn name(&self) -> &'static str {
@@ -344,102 +342,6 @@ impl Metric for TestabilityMetric {
     }
 }
 
-impl Metric for ObservabilityMetric {
-    fn name(&self) -> &'static str {
-        "observability"
-    }
-
-    fn weight(&self) -> u8 {
-        1
-    }
-
-    fn analyze(&self, snapshot: &RepositorySnapshot, config: &ReviewConfig) -> MetricResult {
-        let mut score: i32 = 100;
-        let mut findings = Vec::new();
-        let enabled_targets = count_enabled_observability_targets(config);
-        let total_targets = total_observability_targets();
-
-        if enabled_targets == 0 {
-            score -= 20;
-            findings.push(finding(
-                Severity::Info,
-                None,
-                self.name(),
-                "all observability targets are disabled",
-                "enable at least one target so the report can surface useful context",
-            ));
-        } else if enabled_targets < total_targets {
-            let missing = total_targets - enabled_targets;
-            let deduction = ((missing as i32) * 4).min(24);
-            score -= deduction;
-            findings.push(finding(
-                Severity::Info,
-                None,
-                self.name(),
-                format!(
-                    "observability coverage enabled for {}/{} targets",
-                    enabled_targets, total_targets
-                ),
-                "enable additional observability targets when the extra context is useful",
-            ));
-        }
-
-        if config.observability.longest_file_ranking && snapshot.files.is_empty() {
-            score -= 20;
-            findings.push(finding(
-                Severity::Warning,
-                None,
-                self.name(),
-                "file ranking was enabled, but no files were collected",
-                "verify the repository path and scanner exclusions",
-            ));
-        }
-
-        if config.observability.longest_function_ranking && snapshot.functions.is_empty() {
-            score -= 10;
-            findings.push(finding(
-                Severity::Warning,
-                None,
-                self.name(),
-                "function ranking was enabled, but no functions were collected",
-                "ensure the repository contains Rust sources that the scanner can parse",
-            ));
-        }
-
-        let git_targets_enabled = git_observability_enabled(config);
-        match (git_targets_enabled, snapshot.git.as_ref()) {
-            (true, None) => {
-                score -= 30;
-                findings.push(finding(
-                    Severity::Warning,
-                    None,
-                    self.name(),
-                    "git observability was enabled, but git metadata is unavailable",
-                    "run the review inside a git repository with readable history",
-                ));
-            }
-            (true, Some(git)) if git.total_commits == 0 => {
-                score -= 10;
-                findings.push(finding(
-                    Severity::Info,
-                    None,
-                    self.name(),
-                    "git metadata was collected, but no commits were reported",
-                    "confirm the repository has accessible commit history",
-                ));
-            }
-            _ => {}
-        }
-
-        MetricResult {
-            name: self.name(),
-            weight: config.thresholds.observability_weight,
-            score: clamp_score(score),
-            findings,
-        }
-    }
-}
-
 fn finding(
     severity: Severity,
     file: Option<String>,
@@ -496,37 +398,4 @@ fn max_line_length(snapshot: &RepositorySnapshot) -> Option<(String, usize)> {
             })
         })
         .max_by_key(|(_, len)| *len)
-}
-
-fn count_enabled_observability_targets(config: &ReviewConfig) -> usize {
-    [
-        config.observability.file_names,
-        config.observability.file_paths,
-        config.observability.file_line_counts,
-        config.observability.file_sizes,
-        config.observability.longest_file_ranking,
-        config.observability.longest_function_ranking,
-        config.observability.contributor_count,
-        config.observability.per_author_commit_counts,
-        config.observability.total_commit_count,
-        config.observability.commit_concentration,
-        config.observability.most_recent_active_authors,
-        config.observability.code_change_hotspots,
-    ]
-    .into_iter()
-    .filter(|enabled| *enabled)
-    .count()
-}
-
-fn total_observability_targets() -> usize {
-    12
-}
-
-fn git_observability_enabled(config: &ReviewConfig) -> bool {
-    config.observability.contributor_count
-        || config.observability.per_author_commit_counts
-        || config.observability.total_commit_count
-        || config.observability.commit_concentration
-        || config.observability.most_recent_active_authors
-        || config.observability.code_change_hotspots
 }

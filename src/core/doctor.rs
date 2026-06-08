@@ -71,7 +71,11 @@ fn section_title(text: &str) {
 }
 
 fn print_health_report(results: &[CheckResult]) {
-    println!("{} {}", status_label(true), "Environment looks healthy".green().bold());
+    println!(
+        "{} {}",
+        status_label(true),
+        "Environment looks healthy".green().bold()
+    );
     println!("All required tools are installed and responding normally.");
     println!();
 
@@ -90,11 +94,18 @@ fn print_health_report(results: &[CheckResult]) {
         );
     }
     println!();
-    println!("{}", "Everything looks good. You can use this environment normally.".green());
+    println!(
+        "{}",
+        "Everything looks good. You can use this environment normally.".green()
+    );
 }
 
 fn print_unhealthy_report(results: &[CheckResult], tools: &[ToolCheck]) {
-    println!("{} {}", status_label(false), "Environment needs attention".red().bold());
+    println!(
+        "{} {}",
+        status_label(false),
+        "Environment needs attention".red().bold()
+    );
     println!("Some required tools are missing or not usable.");
     println!();
 
@@ -116,23 +127,43 @@ fn print_unhealthy_report(results: &[CheckResult], tools: &[ToolCheck]) {
             );
         } else {
             unhealthy_count += 1;
-            println!("{} {:<8} {}", status_label(false), result.name.bold(), "not ready".red());
+            println!(
+                "{} {:<8} {}",
+                status_label(false),
+                result.name.bold(),
+                "not ready".red()
+            );
             if let Some(err) = &result.error {
                 println!("   {} {}", "reason:".yellow().bold(), err);
             }
             if let Some(tool) = tools.iter().find(|tool| tool.name == result.name) {
                 println!("   {} {}", "fix:".yellow().bold(), tool.install_hint);
-                println!("   {} {}", "verify:".yellow().bold(), format!("{} --version", tool.command).dimmed());
+                println!(
+                    "   {} {}",
+                    "verify:".yellow().bold(),
+                    format!("{} --version", tool.command).dimmed()
+                );
             }
         }
     }
 
     println!();
     section_title("Summary");
-    println!("Healthy:   {}", results.iter().filter(|r| r.installed && r.exit_ok).count().to_string().green());
+    println!(
+        "Healthy:   {}",
+        results
+            .iter()
+            .filter(|r| r.installed && r.exit_ok)
+            .count()
+            .to_string()
+            .green()
+    );
     println!("Unhealthy: {}", unhealthy_count.to_string().red());
     println!();
-    println!("{}", "Tip: fix the failed tools above and run `molecrab doctor` again.".cyan());
+    println!(
+        "{}",
+        "Tip: fix the failed tools above and run `molecrab doctor` again.".cyan()
+    );
 }
 
 fn check_tool(tool: &ToolCheck) -> CheckResult {
@@ -165,8 +196,7 @@ fn check_tool(tool: &ToolCheck) -> CheckResult {
                 } else {
                     Some(format!(
                         "command exited with status {} when running `{}`",
-                        output.status,
-                        tool.command
+                        output.status, tool.command
                     ))
                 },
             }

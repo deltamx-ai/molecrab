@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 /// max_file_lines = 400
 /// max_long_lines = 160
 /// max_path_depth = 6
+/// max_function_lines = 60
+/// max_function_params = 5
 /// max_unwrap_count = 2
 /// max_expect_count = 2
 /// max_panic_count = 0
@@ -26,6 +28,10 @@ use std::path::{Path, PathBuf};
 /// min_function_lines_for_rank = 20
 /// top_file_rankings = 5
 /// top_function_rankings = 5
+/// top_stylesheet_rankings = 5
+/// top_priorities = 8
+/// top_hotspots = 10
+/// failing_metric_score = 60
 ///
 /// [observability]
 /// file_names = true
@@ -34,6 +40,8 @@ use std::path::{Path, PathBuf};
 /// file_sizes = true
 /// longest_file_ranking = true
 /// longest_function_ranking = true
+/// function_param_analysis = true
+/// longest_stylesheet_ranking = true
 /// contributor_count = true
 /// per_author_commit_counts = true
 /// total_commit_count = true
@@ -46,6 +54,7 @@ use std::path::{Path, PathBuf};
 pub struct ReviewConfig {
     pub thresholds: ReviewThresholds,
     pub observability: ObservabilityTargets,
+    pub classification: ClassificationConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -56,6 +65,8 @@ pub struct ReviewThresholds {
     pub max_file_lines: u32,
     pub max_long_lines: u32,
     pub max_path_depth: u32,
+    pub max_function_lines: u32,
+    pub max_function_params: u32,
     pub max_unwrap_count: u32,
     pub max_expect_count: u32,
     pub max_panic_count: u32,
@@ -66,6 +77,22 @@ pub struct ReviewThresholds {
     pub min_function_lines_for_rank: u32,
     pub top_file_rankings: u32,
     pub top_function_rankings: u32,
+    pub top_stylesheet_rankings: u32,
+    pub top_priorities: u32,
+    pub top_hotspots: u32,
+    pub failing_metric_score: u8,
+}
+
+/// Rules that decide how files are categorized (source / test / generated /
+/// vendor / docs / config). Built-in defaults cover the common cases; these
+/// lists only *add* to them. Paths are matched case-insensitively.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
+#[serde(default)]
+pub struct ClassificationConfig {
+    /// Extra path substrings that mark a file as generated (e.g. "codegen/").
+    pub extra_generated: Vec<String>,
+    /// Extra directory names treated as vendored / ignored.
+    pub extra_ignored_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -77,6 +104,8 @@ pub struct ObservabilityTargets {
     pub file_sizes: bool,
     pub longest_file_ranking: bool,
     pub longest_function_ranking: bool,
+    pub function_param_analysis: bool,
+    pub longest_stylesheet_ranking: bool,
     pub contributor_count: bool,
     pub per_author_commit_counts: bool,
     pub total_commit_count: bool,
@@ -95,6 +124,8 @@ impl Default for ReviewThresholds {
             max_file_lines: 400,
             max_long_lines: 160,
             max_path_depth: 6,
+            max_function_lines: 60,
+            max_function_params: 5,
             max_unwrap_count: 2,
             max_expect_count: 2,
             max_panic_count: 0,
@@ -105,6 +136,10 @@ impl Default for ReviewThresholds {
             min_function_lines_for_rank: 20,
             top_file_rankings: 5,
             top_function_rankings: 5,
+            top_stylesheet_rankings: 5,
+            top_priorities: 8,
+            top_hotspots: 10,
+            failing_metric_score: 60,
         }
     }
 }
@@ -118,6 +153,8 @@ impl Default for ObservabilityTargets {
             file_sizes: true,
             longest_file_ranking: true,
             longest_function_ranking: true,
+            function_param_analysis: true,
+            longest_stylesheet_ranking: true,
             contributor_count: true,
             per_author_commit_counts: true,
             total_commit_count: true,
@@ -182,6 +219,12 @@ impl ReviewConfig {
         }
         if self.observability.longest_function_ranking {
             targets.push("longest_function_ranking");
+        }
+        if self.observability.function_param_analysis {
+            targets.push("function_param_analysis");
+        }
+        if self.observability.longest_stylesheet_ranking {
+            targets.push("longest_stylesheet_ranking");
         }
         if self.observability.contributor_count {
             targets.push("contributor_count");

@@ -6,7 +6,8 @@ pub fn run(command: Commands) -> i32 {
             path,
             config,
             format,
-        } => core::review::run(path, config, format),
+            since,
+        } => core::review::run(path, config, format, since),
         Commands::Doctor => {
             core::doctor::run();
             0

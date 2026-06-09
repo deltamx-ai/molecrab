@@ -28,6 +28,10 @@ pub enum Commands {
         /// Output format for the review report.
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
+
+        /// Only review files changed since this git ref (e.g. `main`, `HEAD~1`).
+        #[arg(long)]
+        since: Option<String>,
     },
 
     /// Check whether common developer tools are installed and usable.

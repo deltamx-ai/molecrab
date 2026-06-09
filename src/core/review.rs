@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::PathBuf;
 
@@ -11,14 +11,19 @@ use super::classify::FileCategory;
 use super::config::ReviewConfig;
 use super::metrics;
 use super::model::{
-    AreaHealth, FileRanking, Finding, FunctionRanking, FunctionSnapshot, FunctionSummary,
-    LanguageCount, MetricResult, Priority, RepositorySnapshot, ReviewReport, Severity,
-    StylesheetRanking, area_of, is_dead_code_candidate,
+    AreaHealth, CategoryCount, FileRanking, Finding, FunctionRanking, FunctionSnapshot,
+    FunctionSummary, LanguageCount, MetricResult, Priority, RepositorySnapshot, ReviewReport,
+    ReviewScope, Severity, StylesheetRanking, area_of, is_dead_code_candidate,
 };
 use super::scanner;
 
-pub fn run(path: PathBuf, config_path: Option<PathBuf>, format: OutputFormat) -> i32 {
-    match analyze(path, config_path) {
+pub fn run(
+    path: PathBuf,
+    config_path: Option<PathBuf>,
+    format: OutputFormat,
+    since: Option<String>,
+) -> i32 {
+    match analyze(path, config_path, since) {
         Ok(report) => {
             match format {
                 OutputFormat::Text => println!("{}", render_text_report(&report)),
@@ -39,19 +44,34 @@ pub fn run(path: PathBuf, config_path: Option<PathBuf>, format: OutputFormat) ->
     }
 }
 
-pub fn analyze(path: PathBuf, config_path: Option<PathBuf>) -> Result<ReviewReport, String> {
+pub fn analyze(
+    path: PathBuf,
+    config_path: Option<PathBuf>,
+    since: Option<String>,
+) -> Result<ReviewReport, String> {
     let config = ReviewConfig::load_for_repository(&path, config_path.as_deref())?;
     let snapshot = scanner::scan_repository(&path, &config)?;
     let metric_results = metrics::evaluate(&snapshot, &config);
-    Ok(build_report(snapshot, config, metric_results))
+    let mut report = build_report(&snapshot, config, metric_results);
+
+    if let Some(since) = since {
+        let changed = scanner::changed_files(&path, &since).ok_or_else(|| {
+            format!("cannot diff against '{since}' — not a git repository or unknown ref")
+        })?;
+        let changed: HashSet<String> = changed.into_iter().collect();
+        scope_report_to_diff(&mut report, &snapshot, &since, &changed);
+    }
+
+    Ok(report)
 }
 
 fn build_report(
-    snapshot: RepositorySnapshot,
+    snapshot: &RepositorySnapshot,
     config: ReviewConfig,
     metrics: Vec<MetricResult>,
 ) -> ReviewReport {
     let findings = dedupe_findings(&metrics);
+    let issue_categories = summarize_categories(&findings);
 
     // Honest score: the real weighted average, never floored upward. The
     // configured `overall_score` is a pass/fail gate, not a minimum to display.
@@ -64,10 +84,10 @@ fn build_report(
         .min_by_key(|metric| metric.score)
         .map(|m| m.name);
 
-    let priorities = build_priorities(&snapshot, &metrics, &config);
-    let areas = build_areas(&snapshot, &metrics);
+    let priorities = build_priorities(snapshot, &metrics, &config);
+    let areas = build_areas(snapshot, &metrics);
 
-    let categories = category_map(&snapshot);
+    let categories = category_map(snapshot);
     let unreferenced: Vec<&FunctionSnapshot> = snapshot
         .functions
         .iter()
@@ -78,19 +98,27 @@ fn build_report(
             )
         })
         .collect();
+    let dead_set: HashSet<(&str, usize)> = unreferenced
+        .iter()
+        .map(|f| (f.file.as_str(), f.start_line))
+        .collect();
+    let all_functions: Vec<&FunctionSnapshot> = snapshot.functions.iter().collect();
 
     let profile = snapshot.profile.clone();
-    let file_rankings = rank_files(&snapshot, &config);
-    let function_summary = build_function_summary(&snapshot, &config, unreferenced.len());
-    let function_rankings = rank_functions(&snapshot, &config);
-    let param_hygiene = rank_param_hygiene(&snapshot, &config);
+    let file_rankings = rank_files(snapshot, &config);
+    let function_summary = build_function_summary(&all_functions, &config, unreferenced.len());
+    let function_rankings = rank_functions(snapshot, &config);
+    let param_hygiene = rank_param_hygiene(snapshot, &config);
     let dead_code = rank_dead_code(&unreferenced, &config);
-    let stylesheet_rankings = rank_stylesheets(&snapshot, &config);
-    let git = trimmed_git(&snapshot, &config);
+    let most_complex = rank_most_complex(snapshot, &config);
+    let most_notable = rank_notable_functions(snapshot, &config, &dead_set);
+    let stylesheet_rankings = rank_stylesheets(snapshot, &config);
+    let git = trimmed_git(snapshot, &config);
 
     ReviewReport {
         profile,
         config,
+        scope: None,
         metrics,
         findings,
         priorities,
@@ -100,33 +128,37 @@ fn build_report(
         verdict,
         passed,
         worst_metric,
+        issue_categories,
         file_rankings,
         function_summary,
         function_rankings,
         param_hygiene,
         dead_code,
+        most_complex,
+        most_notable,
         stylesheet_rankings,
         git,
     }
 }
 
-/// Aggregates judgment-free statistics over every analyzed function. Thresholds
+/// Aggregates judgment-free statistics over the given functions. Thresholds
 /// (long / over-limit) come from config; the summary only counts, it does not
-/// judge — findings do that. `unreferenced_function_count` is passed in since it
-/// needs file categories the caller already computed.
+/// judge — findings do that. Takes a function slice (not the whole snapshot) so
+/// it can be reused for the changed-files subset in diff mode.
 fn build_function_summary(
-    snapshot: &RepositorySnapshot,
+    functions: &[&FunctionSnapshot],
     config: &ReviewConfig,
     unreferenced_function_count: usize,
 ) -> FunctionSummary {
-    let functions = &snapshot.functions;
     let max_lines = config.thresholds.max_function_lines as usize;
     let max_params = config.thresholds.max_function_params as usize;
+    let max_cyclomatic = config.thresholds.max_cyclomatic as usize;
 
     let function_count = functions.len();
     let total_lines: usize = functions.iter().map(|f| f.lines).sum();
     let total_param_count: usize = functions.iter().map(|f| f.param_count).sum();
     let unused_param_count: usize = functions.iter().map(|f| f.unused_params.len()).sum();
+    let total_cyclomatic: usize = functions.iter().map(|f| f.cyclomatic).sum();
 
     let mut breakdown: BTreeMap<&'static str, usize> = BTreeMap::new();
     for function in functions {
@@ -161,6 +193,12 @@ fn build_function_summary(
             .filter(|f| !f.unused_params.is_empty())
             .count(),
         unreferenced_function_count,
+        average_cyclomatic: mean(total_cyclomatic, function_count),
+        max_cyclomatic: functions.iter().map(|f| f.cyclomatic).max().unwrap_or(0),
+        complex_function_count: functions
+            .iter()
+            .filter(|f| f.cyclomatic > max_cyclomatic)
+            .count(),
         language_breakdown,
     }
 }
@@ -171,6 +209,60 @@ fn mean(total: usize, count: usize) -> f64 {
     } else {
         (total as f64) / (count as f64)
     }
+}
+
+/// Narrows a whole-repo report down to a diff: keeps only the findings and
+/// evidence that touch changed files, recomputes the category and function
+/// summaries over that subset, and records the scope. The metric scores stay
+/// repo-wide (the header says so) — re-scoring to the change is a larger change
+/// left for later.
+fn scope_report_to_diff(
+    report: &mut ReviewReport,
+    snapshot: &RepositorySnapshot,
+    since: &str,
+    changed: &HashSet<String>,
+) {
+    let in_scope = |file: &str| changed.contains(file);
+    report
+        .findings
+        .retain(|f| f.file.as_deref().is_some_and(in_scope));
+    report
+        .priorities
+        .retain(|p| p.file.as_deref().is_some_and(in_scope));
+    report.issue_categories = summarize_categories(&report.findings);
+    report.function_rankings.retain(|r| in_scope(&r.file));
+    report.param_hygiene.retain(|r| in_scope(&r.file));
+    report.dead_code.retain(|r| in_scope(&r.file));
+    report.most_complex.retain(|r| in_scope(&r.file));
+    report.most_notable.retain(|r| in_scope(&r.file));
+    report.file_rankings.retain(|r| in_scope(&r.path));
+    // Areas are a whole-repo rollup; not meaningful for a handful of changed files.
+    report.areas.clear();
+
+    // Recompute the function summary over just the changed functions.
+    let categories = category_map(snapshot);
+    let changed_fns: Vec<&FunctionSnapshot> = snapshot
+        .functions
+        .iter()
+        .filter(|f| in_scope(&f.file))
+        .collect();
+    let unreferenced = snapshot
+        .functions
+        .iter()
+        .filter(|f| in_scope(&f.file))
+        .filter(|f| {
+            is_dead_code_candidate(
+                f,
+                categories.get(f.file.as_str()) == Some(&FileCategory::Source),
+            )
+        })
+        .count();
+    report.function_summary = build_function_summary(&changed_fns, &report.config, unreferenced);
+
+    report.scope = Some(ReviewScope {
+        since: since.to_string(),
+        changed_file_count: changed.len(),
+    });
 }
 
 /// Collapses the per-metric findings into one list, dropping exact duplicates
@@ -193,6 +285,38 @@ fn dedupe_findings(metrics: &[MetricResult]) -> Vec<Finding> {
     out
 }
 
+/// Groups findings into reviewer categories with counts — the "what kinds of
+/// problems exist" overview. Ordered worst-severity first, then by count.
+fn summarize_categories(findings: &[Finding]) -> Vec<CategoryCount> {
+    let mut map: HashMap<&'static str, (usize, u8)> = HashMap::new();
+    for finding in findings {
+        let entry = map.entry(finding.category).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = entry.1.max(severity_rank(finding.severity));
+    }
+    let mut ordered: Vec<(&'static str, usize, u8)> = map
+        .into_iter()
+        .map(|(category, (count, severity))| (category, count, severity))
+        .collect();
+    ordered.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(b.0))
+    });
+    ordered
+        .into_iter()
+        .map(|(category, count, _)| CategoryCount { category, count })
+        .collect()
+}
+
+fn severity_rank(severity: Severity) -> u8 {
+    match severity {
+        Severity::Error => 3,
+        Severity::Warning => 2,
+        Severity::Info => 1,
+    }
+}
+
 /// Ranks every finding by impact and keeps the most important ones. Impact
 /// blends severity, the metric's weight, the finding's score penalty, and
 /// whether it points at first-party source (noise files never reach here).
@@ -210,6 +334,7 @@ fn build_priorities(
                 impact: impact_of(finding, metric.weight, &categories),
                 severity: finding.severity,
                 metric: finding.metric,
+                category: finding.category,
                 file: finding.file.clone(),
                 message: finding.message.clone(),
                 suggestion: finding.suggestion.clone(),
@@ -503,12 +628,96 @@ fn rank_dead_code(
     functions
 }
 
+/// Evidence: the most complex functions, by cyclomatic complexity.
+fn rank_most_complex(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Vec<FunctionRanking> {
+    if !config.observability.longest_function_ranking {
+        return Vec::new();
+    }
+    let mut functions: Vec<FunctionRanking> = snapshot
+        .functions
+        .iter()
+        .filter(|func| func.cyclomatic > 1)
+        .map(|func| to_function_ranking(func, config))
+        .collect();
+    functions.sort_by(|a, b| {
+        b.cyclomatic
+            .cmp(&a.cyclomatic)
+            .then_with(|| b.max_nesting.cmp(&a.max_nesting))
+            .then_with(|| a.file.cmp(&b.file))
+    });
+    let limit = config.thresholds.top_function_rankings as usize;
+    if limit == 0 {
+        functions.clear();
+    } else {
+        functions.truncate(limit);
+    }
+    functions
+}
+
+/// Evidence for the compact text report: the functions worth a look, each shown
+/// once, ranked by an overall "concern" score (length + complexity + nesting +
+/// unused params + dead). Functions in `dead` get a `dead?` flag. Only functions
+/// with at least one flag are notable.
+fn rank_notable_functions(
+    snapshot: &RepositorySnapshot,
+    config: &ReviewConfig,
+    dead: &HashSet<(&str, usize)>,
+) -> Vec<FunctionRanking> {
+    if !config.observability.longest_function_ranking {
+        return Vec::new();
+    }
+    let mut rows: Vec<FunctionRanking> = snapshot
+        .functions
+        .iter()
+        .map(|func| {
+            let mut ranking = to_function_ranking(func, config);
+            if dead.contains(&(func.file.as_str(), func.start_line)) {
+                ranking.flags.push("dead?");
+            }
+            ranking
+        })
+        .filter(|ranking| !ranking.flags.is_empty())
+        .collect();
+    rows.sort_by(|a, b| {
+        notable_concern(b)
+            .cmp(&notable_concern(a))
+            .then_with(|| a.file.cmp(&b.file))
+    });
+    let limit = config.thresholds.top_function_rankings as usize;
+    if limit == 0 {
+        rows.clear();
+    } else {
+        rows.truncate(limit);
+    }
+    rows
+}
+
+fn notable_concern(ranking: &FunctionRanking) -> usize {
+    ranking.lines
+        + ranking.cyclomatic * 4
+        + ranking.max_nesting * 8
+        + ranking.unused_params.len() * 40
+        + if ranking.flags.contains(&"dead?") {
+            80
+        } else {
+            0
+        }
+}
+
 fn to_function_ranking(func: &FunctionSnapshot, config: &ReviewConfig) -> FunctionRanking {
     let max_lines = config.thresholds.max_function_lines as usize;
     let max_params = config.thresholds.max_function_params as usize;
+    let max_cyclomatic = config.thresholds.max_cyclomatic as usize;
+    let max_nesting = config.thresholds.max_function_nesting as usize;
     let mut flags = Vec::new();
     if func.lines > max_lines {
         flags.push("long");
+    }
+    if func.cyclomatic > max_cyclomatic {
+        flags.push("complex");
+    }
+    if func.max_nesting > max_nesting {
+        flags.push("deeply-nested");
     }
     if func.param_count > max_params {
         flags.push("many-params");
@@ -528,6 +737,8 @@ fn to_function_ranking(func: &FunctionSnapshot, config: &ReviewConfig) -> Functi
         unused_params: func.unused_params.clone(),
         references: func.references,
         referenced_by: func.referenced_by.clone(),
+        cyclomatic: func.cyclomatic,
+        max_nesting: func.max_nesting,
         flags,
     }
 }
@@ -589,7 +800,8 @@ fn rank_stylesheets(
 fn render_text_report(report: &ReviewReport) -> String {
     let mut out = String::new();
     render_summary(&mut out, report);
-    render_priorities(&mut out, report);
+    render_fix_first(&mut out, report);
+    render_issues_by_category(&mut out, report);
     render_scores(&mut out, report);
     render_areas(&mut out, report);
     render_functions(&mut out, report);
@@ -610,6 +822,18 @@ fn render_summary(out: &mut String, report: &ReviewReport) {
         "molecrab".bold().cyan(),
         report.profile.path().dimmed()
     );
+    if let Some(scope) = &report.scope {
+        let _ = writeln!(
+            out,
+            "{}",
+            format!(
+                "diff review: {} changed file(s) since {} (score is repo-wide)",
+                scope.changed_file_count, scope.since
+            )
+            .bold()
+            .magenta()
+        );
+    }
     let _ = writeln!(out);
 
     let verdict = report.verdict;
@@ -655,6 +879,22 @@ fn render_summary(out: &mut String, report: &ReviewReport) {
         )
         .dimmed()
     );
+
+    let total_problems: usize = report.issue_categories.iter().map(|c| c.count).sum();
+    if total_problems > 0 {
+        let breakdown = report
+            .issue_categories
+            .iter()
+            .map(|c| format!("{} {}", c.category, c.count))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let _ = writeln!(
+            out,
+            "  {} problems · {}",
+            total_problems.to_string().bold(),
+            breakdown
+        );
+    }
     let _ = writeln!(out);
 }
 
@@ -674,22 +914,14 @@ fn verdict_label(grade: &str, metrics: &[MetricResult], failing_metric_score: u8
     }
 }
 
-fn render_priorities(out: &mut String, report: &ReviewReport) {
-    heading(out, "Top issues");
+/// The "start here" pointer: the three highest-impact problems, one line each.
+/// A shortcut into the full categorized list below ("if you only fix 3 things").
+fn render_fix_first(out: &mut String, report: &ReviewReport) {
     if report.priorities.is_empty() {
-        let _ = writeln!(out, "  {}", "no issues found".green());
-        let _ = writeln!(out);
         return;
     }
-
-    for (idx, priority) in report.priorities.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "  {} {}  {}",
-            format!("{}.", idx + 1).bold(),
-            severity_badge(priority.severity),
-            priority.message,
-        );
+    heading(out, "Fix first");
+    for (idx, priority) in report.priorities.iter().take(3).enumerate() {
         let location = priority
             .file
             .as_deref()
@@ -697,16 +929,62 @@ fn render_priorities(out: &mut String, report: &ReviewReport) {
             .unwrap_or_else(|| "repo-wide".dimmed().to_string());
         let _ = writeln!(
             out,
-            "      {}  {}",
+            "  {} {}  {}  {}",
+            format!("{}.", idx + 1).bold(),
+            severity_badge(priority.severity),
+            priority.message,
             location,
-            format!("[{}]", priority.metric).dimmed()
         );
+    }
+    let _ = writeln!(out);
+}
+
+/// The reviewer's main view: problems grouped by category ("what kind of
+/// problem"), categories ordered worst-first, findings within ordered by
+/// severity. This replaces a flat issue list so a reviewer can see, at a
+/// glance, what kinds of problems exist and where.
+fn render_issues_by_category(out: &mut String, report: &ReviewReport) {
+    heading(out, "Issues");
+    if report.findings.is_empty() {
+        let _ = writeln!(out, "  {}", "no issues found".green());
+        let _ = writeln!(out);
+        return;
+    }
+
+    for category in &report.issue_categories {
+        let mut items: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.category == category.category)
+            .collect();
+        items.sort_by(|a, b| severity_rank(b.severity).cmp(&severity_rank(a.severity)));
+
         let _ = writeln!(
             out,
-            "      {} {}",
-            "->".dimmed(),
-            priority.suggestion.dimmed()
+            "  {} {}",
+            category.category.bold(),
+            format!("({})", category.count).dimmed()
         );
+        for finding in items {
+            let location = finding
+                .file
+                .as_deref()
+                .map(|file| file.cyan().to_string())
+                .unwrap_or_else(|| "repo-wide".dimmed().to_string());
+            let _ = writeln!(
+                out,
+                "    {}  {}",
+                severity_badge(finding.severity),
+                finding.message
+            );
+            let _ = writeln!(
+                out,
+                "        {}  {} {}",
+                location,
+                "->".dimmed(),
+                finding.suggestion.dimmed()
+            );
+        }
     }
     let _ = writeln!(out);
 }
@@ -766,9 +1044,9 @@ fn render_areas(out: &mut String, report: &ReviewReport) {
     let _ = writeln!(out);
 }
 
-/// Function observability, two layers: a judgment-free statistical **summary**
-/// first (overall health at a glance), then the **evidence** (longest functions
-/// and unused-parameter samples).
+/// Function observability: a compact statistical summary, then a single
+/// "Notable functions" table (size/complexity/usage outliers, each shown once).
+/// The granular per-category rankings live in the JSON output.
 fn render_functions(out: &mut String, report: &ReviewReport) {
     if !report.config.observability.longest_function_ranking {
         return;
@@ -782,12 +1060,18 @@ fn render_functions(out: &mut String, report: &ReviewReport) {
     }
 
     let max_lines = report.config.thresholds.max_function_lines as usize;
-    let max_params = report.config.thresholds.max_function_params as usize;
+    let max_cyclomatic = report.config.thresholds.max_cyclomatic as usize;
 
-    // ---- Summary (facts only) ----
+    // ---- Summary: two compact fact lines ----
+    let langs = summary
+        .language_breakdown
+        .iter()
+        .map(|lang| format!("{} {}", lang.language, lang.count))
+        .collect::<Vec<_>>()
+        .join(" · ");
     let _ = writeln!(
         out,
-        "  {} functions · avg {:.0} lines · max {} · {}",
+        "  {} fns · avg {:.0} / max {} lines · {} · {}",
         summary.function_count,
         summary.average_function_lines,
         summary.max_function_lines,
@@ -795,143 +1079,83 @@ fn render_functions(out: &mut String, report: &ReviewReport) {
             summary.long_function_count,
             format!("{} long (>{})", summary.long_function_count, max_lines),
         ),
+        langs.dimmed(),
     );
     let _ = writeln!(
         out,
-        "  {} params · avg {:.1}/fn · {} zero-arg · {} with 4+ · {}",
-        summary.total_param_count,
-        summary.average_param_count,
-        summary.zero_param_function_count,
-        summary.four_plus_param_function_count,
+        "  cc avg {:.1} / max {} · {} · params avg {:.1} · {} · {}",
+        summary.average_cyclomatic,
+        summary.max_cyclomatic,
         paint_count(
-            summary.over_param_limit_count,
+            summary.complex_function_count,
             format!(
-                "{} over limit (>{})",
-                summary.over_param_limit_count, max_params
+                "{} complex (>{})",
+                summary.complex_function_count, max_cyclomatic
             ),
         ),
+        summary.average_param_count,
+        paint_count(
+            summary.unused_param_count,
+            format!("{} unused-param", summary.unused_param_count),
+        ),
+        paint_count(
+            summary.unreferenced_function_count,
+            format!("{} unreferenced", summary.unreferenced_function_count),
+        ),
     );
-    if summary.unused_param_count > 0 {
-        let _ = writeln!(
-            out,
-            "  {}",
-            format!(
-                "{} unused param(s) across {} function(s)",
-                summary.unused_param_count, summary.functions_with_unused_params
-            )
-            .yellow(),
-        );
-    }
-    if summary.unreferenced_function_count > 0 {
-        let _ = writeln!(
-            out,
-            "  {}",
-            format!(
-                "{} unreferenced function(s) — possible dead code",
-                summary.unreferenced_function_count
-            )
-            .yellow(),
-        );
-    }
-    if !summary.language_breakdown.is_empty() {
-        let langs = summary
-            .language_breakdown
-            .iter()
-            .map(|lang| format!("{} {}", lang.language, lang.count))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let _ = writeln!(out, "  {}", format!("languages: {}", langs).dimmed());
-    }
     let _ = writeln!(out);
 
-    // ---- Evidence ----
-    if !report.function_rankings.is_empty() {
-        let _ = writeln!(out, "  {}", "Longest functions".bold());
-        for func in &report.function_rankings {
-            render_function_entry(out, func, false);
+    // ---- Notable functions: one deduplicated, concern-ranked table ----
+    if report.most_notable.is_empty() {
+        let _ = writeln!(out, "  {}", "no notable functions".green());
+    } else {
+        let _ = writeln!(out, "  {}", "Notable functions".bold());
+        for func in &report.most_notable {
+            render_notable_function(out, func);
         }
-        let _ = writeln!(out);
     }
-    if report.config.observability.function_param_analysis && !report.param_hygiene.is_empty() {
-        let _ = writeln!(out, "  {}", "Unused parameters".bold());
-        for func in &report.param_hygiene {
-            render_function_entry(out, func, false);
-        }
-        let _ = writeln!(out);
-    }
-    if !report.dead_code.is_empty() {
-        let _ = writeln!(out, "  {}", "Possibly unused (no references)".bold());
-        for func in &report.dead_code {
-            render_function_entry(out, func, true);
-        }
-        let _ = writeln!(out);
-    }
+    let _ = writeln!(out);
 }
 
-/// One function rendered as evidence: a name + quality-flags line, then a dim
-/// stats + location line. The quality flags come from the analysis layer
-/// (`func.flags`); `unreferenced` adds the "dead?" flag for the dead-code list.
-fn render_function_entry(out: &mut String, func: &FunctionRanking, unreferenced: bool) {
-    let mut flags: Vec<String> = Vec::new();
-    if unreferenced {
-        flags.push("dead?".red().bold().to_string());
+/// One notable function on a single line: name · stats (lines/cc/nesting/params/
+/// refs) · quality flags · location. Quality flags come from the analysis layer.
+fn render_notable_function(out: &mut String, func: &FunctionRanking) {
+    let mut stats = vec![format!("{}L", func.lines), format!("cc{}", func.cyclomatic)];
+    if func.max_nesting > 0 {
+        stats.push(format!("n{}", func.max_nesting));
     }
-    for flag in &func.flags {
-        flags.push(flag.yellow().to_string());
-    }
-    let flags = if flags.is_empty() {
-        "ok".green().to_string()
-    } else {
-        flags.join(" ")
-    };
-
-    let mut stats = vec![format!("{} lines", func.lines)];
     if func.unused_params.is_empty() {
-        stats.push(format!(
-            "{} param{}",
-            func.param_count,
-            plural(func.param_count)
-        ));
+        stats.push(format!("{}p", func.param_count));
     } else {
         stats.push(format!(
-            "{} param{} ({} unused: {})",
+            "{}p({}u)",
             func.param_count,
-            plural(func.param_count),
-            func.unused_params.len(),
-            func.unused_params.join(", ")
+            func.unused_params.len()
         ));
     }
     if super::model::referenceable_fn_name(&func.name).is_some() {
-        stats.push(format!("~{} refs", func.references));
+        stats.push(format!("~{}r", func.references));
     }
-
-    let _ = writeln!(out, "    {}  {}", clip(&func.name, 30).bold(), flags);
+    let flags = func
+        .flags
+        .iter()
+        .map(|flag| {
+            if *flag == "dead?" {
+                flag.red().bold().to_string()
+            } else {
+                flag.yellow().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let _ = writeln!(
         out,
-        "        {}  {}",
-        stats.join(" · "),
-        format!("{}:{}", func.file, func.start_line).dimmed()
+        "    {}  {:<20} {}  {}",
+        format!("{:<26}", clip(&func.name, 26)).bold(),
+        stats.join(" "),
+        flags,
+        format!("{}:{}", func.file, func.start_line).dimmed(),
     );
-    if !func.referenced_by.is_empty() {
-        let shown = func
-            .referenced_by
-            .iter()
-            .take(3)
-            .map(|reference| format!("{} ({})", reference.file, reference.count))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let more = func.referenced_by.len().saturating_sub(3);
-        let suffix = if more > 0 {
-            format!(" (+{} more)", more)
-        } else {
-            String::new()
-        };
-        let _ = writeln!(
-            out,
-            "        {}",
-            format!("used by: {}{}", shown, suffix).dimmed()
-        );
-    }
 }
 
 /// Each line respects its observability config toggle; the whole block is
@@ -964,13 +1188,27 @@ fn render_details(out: &mut String, report: &ReviewReport) {
     }
     if let Some(git) = &report.git {
         if obs.total_commit_count || obs.contributor_count || obs.commit_concentration {
+            let contributors = if git.contributor_count == 1 {
+                "1 contributor".to_string()
+            } else {
+                format!("{} contributors", git.contributor_count)
+            };
+            // A "bus factor" hint: one author, or a few owning almost everything.
+            let ownership = if git.contributor_count == 1 {
+                " · bus factor 1".to_string()
+            } else if git.commit_concentration >= 0.7 {
+                format!(
+                    " · top 3 own {:.0}% (concentrated)",
+                    git.commit_concentration * 100.0
+                )
+            } else {
+                format!(" · top 3 own {:.0}%", git.commit_concentration * 100.0)
+            };
             lines.push((
                 "Git".to_string(),
                 format!(
-                    "{} commits · {} contributors · top-3 own {:.0}%",
-                    git.total_commits,
-                    git.contributor_count,
-                    git.commit_concentration * 100.0
+                    "{} commits · {}{}",
+                    git.total_commits, contributors, ownership
                 ),
             ));
         }
@@ -1088,13 +1326,14 @@ fn base_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-fn plural(count: usize) -> &'static str {
-    if count == 1 { "" } else { "s" }
-}
+/// Version of the JSON report contract. Bump on any breaking shape change so
+/// service consumers can branch on it.
+const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 struct JsonReviewReport {
+    schema_version: u32,
     summary: JsonSummary,
     repository: super::model::RepositoryProfile,
     areas: Vec<super::model::AreaHealth>,
@@ -1112,6 +1351,9 @@ struct JsonSummary {
     passed: bool,
     gate_threshold: u8,
     weakest_metric: Option<&'static str>,
+    problem_count: usize,
+    issue_categories: Vec<CategoryCount>,
+    scope: Option<super::model::ReviewScope>,
 }
 
 #[derive(Serialize)]
@@ -1128,6 +1370,7 @@ struct JsonObservability {
 #[serde(rename_all = "snake_case")]
 struct JsonFunctionRankings {
     longest_functions: Vec<FunctionRanking>,
+    most_complex_functions: Vec<FunctionRanking>,
     functions_with_unused_params: Vec<FunctionRanking>,
     possibly_unused_functions: Vec<FunctionRanking>,
 }
@@ -1135,6 +1378,7 @@ struct JsonFunctionRankings {
 impl JsonReviewReport {
     fn from_report(report: &ReviewReport) -> Self {
         Self {
+            schema_version: SCHEMA_VERSION,
             summary: JsonSummary {
                 score: report.overall,
                 grade: report.grade.clone(),
@@ -1142,6 +1386,9 @@ impl JsonReviewReport {
                 passed: report.passed,
                 gate_threshold: report.config.thresholds.overall_score,
                 weakest_metric: report.worst_metric,
+                problem_count: report.issue_categories.iter().map(|c| c.count).sum(),
+                issue_categories: report.issue_categories.clone(),
+                scope: report.scope.clone(),
             },
             repository: report.profile.clone(),
             areas: report.areas.clone(),
@@ -1151,6 +1398,7 @@ impl JsonReviewReport {
                 function_summary: report.function_summary.clone(),
                 function_rankings: JsonFunctionRankings {
                     longest_functions: report.function_rankings.clone(),
+                    most_complex_functions: report.most_complex.clone(),
                     functions_with_unused_params: report.param_hygiene.clone(),
                     possibly_unused_functions: report.dead_code.clone(),
                 },
@@ -1184,6 +1432,8 @@ mod tests {
             param_count: params,
             params: Vec::new(),
             unused_params: unused.iter().map(|s| s.to_string()).collect(),
+            cyclomatic: 1,
+            max_nesting: 0,
             references: 0,
             referenced_by: Vec::new(),
         }
@@ -1204,7 +1454,8 @@ mod tests {
             None,
         );
 
-        let summary = build_function_summary(&snapshot, &ReviewConfig::default(), 0);
+        let functions_ref: Vec<&FunctionSnapshot> = snapshot.functions.iter().collect();
+        let summary = build_function_summary(&functions_ref, &ReviewConfig::default(), 0);
         assert_eq!(summary.function_count, 3);
         assert_eq!(summary.max_function_lines, 100);
         assert_eq!(summary.long_function_count, 1);

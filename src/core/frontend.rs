@@ -147,7 +147,9 @@ struct Collector<'a> {
     counter: usize,
 }
 
-/// The body a function-like node carries, used for parameter usage counting.
+/// The body a function-like node carries, used for parameter usage counting
+/// and complexity. Holds only references, so it is cheap to copy.
+#[derive(Clone, Copy)]
 enum BodyRef<'a> {
     Block(&'a BlockStmt),
     Expr(&'a Expr),
@@ -474,7 +476,16 @@ impl<'a> Collector<'a> {
         let pats: Vec<&Pat> = function.params.iter().map(|param| &param.pat).collect();
         let body = function.body.as_ref().map(BodyRef::Block);
         let (params, unused) = analyze_params(&pats, body);
-        self.push(name, function.span, function.params.len(), params, unused);
+        let (cyclomatic, max_nesting) = complexity_of(body);
+        self.push(
+            name,
+            function.span,
+            function.params.len(),
+            params,
+            unused,
+            cyclomatic,
+            max_nesting,
+        );
         if let Some(body) = &function.body {
             self.collect_stmts(&body.stmts);
         }
@@ -487,7 +498,16 @@ impl<'a> Collector<'a> {
             BlockStmtOrExpr::Expr(expr) => BodyRef::Expr(expr),
         };
         let (params, unused) = analyze_params(&pats, Some(body));
-        self.push(name, arrow.span, arrow.params.len(), params, unused);
+        let (cyclomatic, max_nesting) = complexity_of(Some(body));
+        self.push(
+            name,
+            arrow.span,
+            arrow.params.len(),
+            params,
+            unused,
+            cyclomatic,
+            max_nesting,
+        );
         match &*arrow.body {
             BlockStmtOrExpr::BlockStmt(block) => self.collect_stmts(&block.stmts),
             BlockStmtOrExpr::Expr(expr) => self.collect_expr(expr, None),
@@ -508,12 +528,22 @@ impl<'a> Collector<'a> {
             .collect();
         let body = ctor.body.as_ref().map(BodyRef::Block);
         let (params, unused) = analyze_params(&pats, body);
-        self.push(name, ctor.span, ctor.params.len(), params, unused);
+        let (cyclomatic, max_nesting) = complexity_of(body);
+        self.push(
+            name,
+            ctor.span,
+            ctor.params.len(),
+            params,
+            unused,
+            cyclomatic,
+            max_nesting,
+        );
         if let Some(body) = &ctor.body {
             self.collect_stmts(&body.stmts);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
         name: String,
@@ -521,6 +551,8 @@ impl<'a> Collector<'a> {
         param_count: usize,
         params: Vec<ParamUsage>,
         unused_params: Vec<String>,
+        cyclomatic: usize,
+        max_nesting: usize,
     ) {
         let lo = self.cm.lookup_char_pos(span.lo());
         let hi = self.cm.lookup_char_pos(span.hi());
@@ -543,6 +575,8 @@ impl<'a> Collector<'a> {
             param_count,
             params,
             unused_params,
+            cyclomatic,
+            max_nesting,
             references: 0,
             referenced_by: Vec::new(),
         });
@@ -654,6 +688,109 @@ impl Visit for RefCounter<'_> {
             *self.counts.entry(symbol.to_string()).or_insert(0) += 1;
         }
     }
+}
+
+// --------------------------------------------------------------------------
+// Complexity (cyclomatic + max nesting)
+// --------------------------------------------------------------------------
+
+/// Cyclomatic complexity (`1 + decision points`) and max control-flow nesting
+/// for one function body. Decision points: if / else-if / loops / switch cases
+/// / catch / ternary (boolean operators are intentionally not counted). Nested
+/// function bodies are excluded — each function is measured on its own.
+fn complexity_of(body: Option<BodyRef>) -> (usize, usize) {
+    let mut visitor = ComplexityVisitor::default();
+    match body {
+        Some(BodyRef::Block(block)) => block.visit_with(&mut visitor),
+        Some(BodyRef::Expr(expr)) => expr.visit_with(&mut visitor),
+        None => {}
+    }
+    (visitor.decisions + 1, visitor.max_depth)
+}
+
+#[derive(Default)]
+struct ComplexityVisitor {
+    decisions: usize,
+    depth: usize,
+    max_depth: usize,
+}
+
+impl ComplexityVisitor {
+    fn nested<F: FnOnce(&mut Self)>(&mut self, body: F) {
+        self.depth += 1;
+        self.max_depth = self.max_depth.max(self.depth);
+        body(self);
+        self.depth -= 1;
+    }
+}
+
+impl Visit for ComplexityVisitor {
+    fn visit_if_stmt(&mut self, node: &IfStmt) {
+        self.decisions += 1;
+        node.test.visit_with(self);
+        self.nested(|v| node.cons.visit_with(v));
+        if let Some(alt) = &node.alt {
+            match &**alt {
+                // `else if` is a flat chain, not deeper nesting.
+                Stmt::If(else_if) => self.visit_if_stmt(else_if),
+                other => self.nested(|v| other.visit_with(v)),
+            }
+        }
+    }
+
+    fn visit_for_stmt(&mut self, node: &ForStmt) {
+        self.decisions += 1;
+        self.nested(|v| node.visit_children_with(v));
+    }
+
+    fn visit_for_in_stmt(&mut self, node: &ForInStmt) {
+        self.decisions += 1;
+        self.nested(|v| node.visit_children_with(v));
+    }
+
+    fn visit_for_of_stmt(&mut self, node: &ForOfStmt) {
+        self.decisions += 1;
+        self.nested(|v| node.visit_children_with(v));
+    }
+
+    fn visit_while_stmt(&mut self, node: &WhileStmt) {
+        self.decisions += 1;
+        self.nested(|v| node.visit_children_with(v));
+    }
+
+    fn visit_do_while_stmt(&mut self, node: &DoWhileStmt) {
+        self.decisions += 1;
+        self.nested(|v| node.visit_children_with(v));
+    }
+
+    fn visit_switch_stmt(&mut self, node: &SwitchStmt) {
+        self.nested(|v| node.visit_children_with(v));
+    }
+
+    fn visit_switch_case(&mut self, node: &SwitchCase) {
+        if node.test.is_some() {
+            self.decisions += 1;
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_try_stmt(&mut self, node: &TryStmt) {
+        self.nested(|v| node.visit_children_with(v));
+    }
+
+    fn visit_catch_clause(&mut self, node: &CatchClause) {
+        self.decisions += 1;
+        node.visit_children_with(self);
+    }
+
+    fn visit_cond_expr(&mut self, node: &CondExpr) {
+        self.decisions += 1;
+        node.visit_children_with(self);
+    }
+
+    // Each function is measured on its own — do not descend into nested ones.
+    fn visit_function(&mut self, _: &Function) {}
+    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
 }
 
 // --------------------------------------------------------------------------
@@ -956,5 +1093,24 @@ mod tests {
                 .any(|f| f.name == "describe(\"auth flow\")")
         );
         assert!(functions.iter().any(|f| f.name == "it(\"returns ok\")"));
+    }
+
+    #[test]
+    fn computes_cyclomatic_and_nesting() {
+        // if (+1) + for (+1) + ternary (+1) → cyclomatic 4; if>for nests to 2.
+        let src = "function f(x: number) { if (x > 0) { for (let i = 0; i < x; i++) {} } return x > 1 ? 1 : 2; }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        assert_eq!(f.cyclomatic, 4);
+        assert!(f.max_nesting >= 2);
+    }
+
+    #[test]
+    fn complexity_excludes_nested_functions() {
+        // The inner arrow's `if` must not count toward `outer`.
+        let src = "function outer() { const cb = (n: number) => { if (n > 0) { return 1; } return 0; }; return cb; }";
+        let functions = scan_functions(&file("o.ts", src), src);
+        let outer = function(&functions, "outer");
+        assert_eq!(outer.cyclomatic, 1);
     }
 }

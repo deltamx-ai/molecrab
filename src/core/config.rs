@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 /// max_path_depth = 6
 /// max_function_lines = 60
 /// max_function_params = 5
+/// max_cyclomatic = 10
+/// max_function_nesting = 4
 /// max_unwrap_count = 2
 /// max_expect_count = 2
 /// max_panic_count = 0
@@ -67,6 +69,8 @@ pub struct ReviewThresholds {
     pub max_path_depth: u32,
     pub max_function_lines: u32,
     pub max_function_params: u32,
+    pub max_cyclomatic: u32,
+    pub max_function_nesting: u32,
     pub max_unwrap_count: u32,
     pub max_expect_count: u32,
     pub max_panic_count: u32,
@@ -126,6 +130,8 @@ impl Default for ReviewThresholds {
             max_path_depth: 6,
             max_function_lines: 60,
             max_function_params: 5,
+            max_cyclomatic: 10,
+            max_function_nesting: 4,
             max_unwrap_count: 2,
             max_expect_count: 2,
             max_panic_count: 0,

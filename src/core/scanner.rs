@@ -264,6 +264,7 @@ fn scan_rust_functions(file: &FileSnapshot, content: &str) -> Vec<FunctionSnapsh
             let start = i + 1;
             let end = find_function_end(&lines, i).unwrap_or(lines.len());
             let line_count = end.saturating_sub(start).max(1);
+            let (cyclomatic, max_nesting) = rust_complexity(&lines[i..end]);
             functions.push(FunctionSnapshot {
                 file: file.path.clone(),
                 name,
@@ -276,6 +277,8 @@ fn scan_rust_functions(file: &FileSnapshot, content: &str) -> Vec<FunctionSnapsh
                 // based, so it reports the parameter count only.
                 params: Vec::new(),
                 unused_params: Vec::new(),
+                cyclomatic,
+                max_nesting,
                 references: 0,
                 referenced_by: Vec::new(),
             });
@@ -433,6 +436,55 @@ fn is_self_receiver(param: &str) -> bool {
     s == "self" || s.starts_with("self:")
 }
 
+/// Approximate cyclomatic complexity and max nesting for a Rust function from
+/// its source lines. Token based (no real AST): counts branch/loop keywords and
+/// `=>` match arms for complexity, and brace depth for nesting. Approximate —
+/// it does not strip comments/strings and counts non-control braces (closures,
+/// struct literals, match blocks), so it can read slightly high.
+fn rust_complexity(func_lines: &[&str]) -> (usize, usize) {
+    let mut decisions = 0usize;
+    let mut brace_depth = 0i32;
+    let mut max_brace = 0i32;
+
+    for line in func_lines {
+        let mut token = String::new();
+        let mut prev = ' ';
+        for ch in line.chars() {
+            if ch == '_' || ch.is_alphanumeric() {
+                token.push(ch);
+            } else {
+                if is_branch_keyword(&token) {
+                    decisions += 1;
+                }
+                token.clear();
+                match ch {
+                    '{' => {
+                        brace_depth += 1;
+                        max_brace = max_brace.max(brace_depth);
+                    }
+                    '}' => brace_depth -= 1,
+                    // `=>` is a match arm in Rust (closures use `|x|`).
+                    '>' if prev == '=' => decisions += 1,
+                    _ => {}
+                }
+            }
+            prev = ch;
+        }
+        if is_branch_keyword(&token) {
+            decisions += 1;
+        }
+    }
+
+    let cyclomatic = decisions + 1;
+    // Subtract the function's own body brace so a flat function nests at 0.
+    let max_nesting = (max_brace - 1).max(0) as usize;
+    (cyclomatic, max_nesting)
+}
+
+fn is_branch_keyword(token: &str) -> bool {
+    matches!(token, "if" | "for" | "while" | "loop")
+}
+
 // --------------------------------------------------------------------------
 // Git history snapshot
 // --------------------------------------------------------------------------
@@ -493,6 +545,31 @@ fn is_git_repo(root: &Path) -> bool {
         .as_deref()
         .map(str::trim)
         == Some("true")
+}
+
+/// Repo-relative paths changed between `since` (a git ref) and the working tree.
+/// Returns `Some(empty)` when there are no changes, and `None` when the diff
+/// cannot be computed (not a git repo, or unknown ref) — so callers can tell
+/// "nothing changed" apart from "could not diff".
+pub fn changed_files(root: &Path, since: &str) -> Option<Vec<String>> {
+    if !is_git_repo(root) {
+        return None;
+    }
+    let output = Command::new("git")
+        .args(["diff", "--name-only", since])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(
+        text.lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+    )
 }
 
 fn run_git_count(root: &Path, args: &[&str]) -> Option<u32> {
@@ -616,6 +693,24 @@ mod tests {
         let src = "fn run(cb: impl Fn(u8) -> bool, n: u8) {}\n";
         let functions = scan_rust_functions(&rust_file(src), src);
         assert_eq!(functions[0].param_count, 2);
+    }
+
+    #[test]
+    fn computes_rust_complexity_and_nesting() {
+        // if (+1) + while (+1) → cyclomatic 3; if > while → nesting 2.
+        let src = "fn f(x: i32) {\n    if x > 0 {\n        while x > 1 {}\n    }\n}\n";
+        let functions = scan_rust_functions(&rust_file(src), src);
+        assert_eq!(functions[0].cyclomatic, 3);
+        assert_eq!(functions[0].max_nesting, 2);
+    }
+
+    #[test]
+    fn counts_match_arms_as_decisions() {
+        // 2 match arms → 2 decisions → cyclomatic 3.
+        let src =
+            "fn f(x: i32) -> i32 {\n    match x {\n        0 => 1,\n        _ => 2,\n    }\n}\n";
+        let functions = scan_rust_functions(&rust_file(src), src);
+        assert_eq!(functions[0].cyclomatic, 3);
     }
 
     #[test]

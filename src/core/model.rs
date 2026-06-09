@@ -97,6 +97,12 @@ pub struct FunctionSnapshot {
     pub param_count: usize,
     pub params: Vec<ParamUsage>,
     pub unused_params: Vec<String>,
+    /// Approximate cyclomatic complexity: 1 + decision points (branches, loops,
+    /// match/switch arms, catch, ternary). AST-accurate for TS/JS; line-based
+    /// approximation for Rust.
+    pub cyclomatic: usize,
+    /// Deepest nesting of control structures within the function body.
+    pub max_nesting: usize,
     /// Approximate number of call sites: how many times the function's name is
     /// referenced across first-party code, minus its own definition. `0` for
     /// anonymous functions (where a name-based count is meaningless).
@@ -193,11 +199,31 @@ pub struct Finding {
     pub severity: Severity,
     pub file: Option<String>,
     pub metric: &'static str,
+    /// Reviewer-facing problem category ("what kind of problem is this":
+    /// Error handling / Complexity / Dead code / ...), distinct from `metric`
+    /// (the scoring dimension). Derived from the finding when it is created.
+    pub category: &'static str,
     pub message: String,
     pub suggestion: String,
     /// Points this finding deducted from its metric. Used as a magnitude signal
     /// when ranking findings by impact. `0` for purely informational notes.
     pub score_penalty: u32,
+}
+
+/// When a review is scoped to a diff (`--since <ref>`), records what it covered.
+/// `None` on the report means a full whole-repository review.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReviewScope {
+    pub since: String,
+    pub changed_file_count: usize,
+}
+
+/// How many problems fall into one reviewer category. The "what kinds of
+/// problems exist" overview.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CategoryCount {
+    pub category: &'static str,
+    pub count: usize,
 }
 
 /// A finding promoted to the prioritized "top issues" list, carrying the
@@ -208,6 +234,7 @@ pub struct Priority {
     pub impact: u32,
     pub severity: Severity,
     pub metric: &'static str,
+    pub category: &'static str,
     pub file: Option<String>,
     pub message: String,
     pub suggestion: String,
@@ -237,6 +264,7 @@ pub struct MetricResult {
 pub struct ReviewReport {
     pub profile: RepositoryProfile,
     pub config: ReviewConfig,
+    pub scope: Option<ReviewScope>,
     pub metrics: Vec<MetricResult>,
     pub findings: Vec<Finding>,
     pub priorities: Vec<Priority>,
@@ -246,11 +274,16 @@ pub struct ReviewReport {
     pub verdict: &'static str,
     pub passed: bool,
     pub worst_metric: Option<&'static str>,
+    pub issue_categories: Vec<CategoryCount>,
     pub file_rankings: Vec<FileRanking>,
     pub function_summary: FunctionSummary,
     pub function_rankings: Vec<FunctionRanking>,
     pub param_hygiene: Vec<FunctionRanking>,
     pub dead_code: Vec<FunctionRanking>,
+    pub most_complex: Vec<FunctionRanking>,
+    /// Deduplicated, concern-ranked outliers for the compact text "Notable
+    /// functions" table (JSON keeps the granular rankings above).
+    pub most_notable: Vec<FunctionRanking>,
     pub stylesheet_rankings: Vec<StylesheetRanking>,
     pub git: Option<GitSnapshot>,
 }
@@ -275,6 +308,8 @@ pub struct FunctionRanking {
     pub unused_params: Vec<String>,
     pub references: usize,
     pub referenced_by: Vec<FileReference>,
+    pub cyclomatic: usize,
+    pub max_nesting: usize,
     /// Quality flags derived in the analysis layer from the configured
     /// thresholds (e.g. "long", "many-params", "unused-param"). The renderer
     /// only displays these; it does not recompute the judgment.
@@ -298,6 +333,9 @@ pub struct FunctionSummary {
     pub unused_param_count: usize,
     pub functions_with_unused_params: usize,
     pub unreferenced_function_count: usize,
+    pub average_cyclomatic: f64,
+    pub max_cyclomatic: usize,
+    pub complex_function_count: usize,
     pub language_breakdown: Vec<LanguageCount>,
 }
 

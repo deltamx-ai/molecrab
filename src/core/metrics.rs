@@ -379,13 +379,49 @@ fn finding(
     suggestion: impl Into<String>,
     score_penalty: u32,
 ) -> Finding {
+    let message = message.into();
+    let category = category_for(metric, &message);
     Finding {
         severity,
         file,
         metric,
-        message: message.into(),
+        category,
+        message,
         suggestion: suggestion.into(),
         score_penalty,
+    }
+}
+
+/// Maps a finding to a reviewer-facing problem category — "what kind of problem
+/// is this". Most metrics map to one category; maintainability splits by what
+/// the finding is actually about. Kept in one place so the taxonomy is easy to
+/// read and change (and is locked by a test).
+fn category_for(metric: &str, message: &str) -> &'static str {
+    match metric {
+        "robustness" => "Error handling",
+        "performance" => "Performance",
+        "testability" => "Testing",
+        "readability" => {
+            if message.contains("TODO") || message.contains("FIXME") {
+                "Hygiene"
+            } else {
+                "Readability"
+            }
+        }
+        "maintainability" => {
+            if message.contains("unused parameter") || message.contains("unreferenced") {
+                "Dead code"
+            } else if message.starts_with("long function")
+                || message.contains("many parameters")
+                || message.starts_with("complex function")
+                || message.contains("nested")
+            {
+                "Complexity"
+            } else {
+                "Structure"
+            }
+        }
+        _ => "Other",
     }
 }
 
@@ -443,6 +479,46 @@ fn check_function_health(
         ));
     }
 
+    let max_cyclomatic = config.thresholds.max_cyclomatic as usize;
+    if let Some(func) = snapshot.functions.iter().max_by_key(|f| f.cyclomatic)
+        && func.cyclomatic > max_cyclomatic
+    {
+        let over = func.cyclomatic - max_cyclomatic;
+        let deduction = ((over as i32 * 2) + 4).min(18);
+        *score -= deduction;
+        findings.push(finding(
+            Severity::Warning,
+            Some(func.file.clone()),
+            metric,
+            format!(
+                "complex function `{}` (cyclomatic ~{}, limit {})",
+                func.name, func.cyclomatic, max_cyclomatic
+            ),
+            "simplify the branching or extract helper functions",
+            deduction as u32,
+        ));
+    }
+
+    let max_nesting = config.thresholds.max_function_nesting as usize;
+    if let Some(func) = snapshot.functions.iter().max_by_key(|f| f.max_nesting)
+        && func.max_nesting > max_nesting
+    {
+        let over = func.max_nesting - max_nesting;
+        let deduction = ((over as i32 * 3) + 3).min(12);
+        *score -= deduction;
+        findings.push(finding(
+            Severity::Warning,
+            Some(func.file.clone()),
+            metric,
+            format!(
+                "deeply nested function `{}` (depth {}, limit {})",
+                func.name, func.max_nesting, max_nesting
+            ),
+            "flatten with early returns or guard clauses",
+            deduction as u32,
+        ));
+    }
+
     let unused_total: usize = snapshot
         .functions
         .iter()
@@ -475,21 +551,31 @@ fn check_function_health(
         .filter(|f| f.is_source())
         .map(|f| f.path.as_str())
         .collect();
-    let dead = snapshot
+    let dead: Vec<&str> = snapshot
         .functions
         .iter()
         .filter(|f| is_dead_code_candidate(f, source_paths.contains(f.file.as_str())))
-        .count();
-    if dead > 0 {
-        let deduction = (dead as i32 * 2).min(12);
+        .map(|f| f.name.as_str())
+        .collect();
+    if !dead.is_empty() {
+        let deduction = (dead.len() as i32 * 2).min(12);
         *score -= deduction;
+        let named = dead.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+        let more = dead.len().saturating_sub(3);
+        let suffix = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
         findings.push(finding(
             Severity::Info,
             None,
             metric,
             format!(
-                "{} function(s) appear unreferenced (possible dead code)",
-                dead
+                "{} function(s) appear unreferenced — possible dead code: {}{}",
+                dead.len(),
+                named,
+                suffix
             ),
             "remove them, or confirm they are public API / entry points",
             deduction as u32,
@@ -553,4 +639,82 @@ fn max_source_line_length(snapshot: &RepositorySnapshot) -> Option<(String, usiz
             })
         })
         .max_by_key(|(_, len)| *len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::category_for;
+
+    #[test]
+    fn categorizes_findings_by_problem_type() {
+        assert_eq!(
+            category_for(
+                "robustness",
+                "found 22 occurrence(s) of unwrap in Rust source"
+            ),
+            "Error handling"
+        );
+        assert_eq!(
+            category_for("maintainability", "long function `f` (267 lines, limit 60)"),
+            "Complexity"
+        );
+        assert_eq!(
+            category_for(
+                "maintainability",
+                "function `f` takes many parameters (8, limit 5)"
+            ),
+            "Complexity"
+        );
+        assert_eq!(
+            category_for(
+                "maintainability",
+                "complex function `f` (cyclomatic ~12, limit 10)"
+            ),
+            "Complexity"
+        );
+        assert_eq!(
+            category_for(
+                "maintainability",
+                "deeply nested function `f` (depth 6, limit 4)"
+            ),
+            "Complexity"
+        );
+        assert_eq!(
+            category_for(
+                "maintainability",
+                "3 function(s) appear unreferenced (possible dead code)"
+            ),
+            "Dead code"
+        );
+        assert_eq!(
+            category_for(
+                "maintainability",
+                "2 unused parameter(s) across 2 function(s)"
+            ),
+            "Dead code"
+        );
+        assert_eq!(
+            category_for("maintainability", "deep file path (depth 8, limit 6)"),
+            "Structure"
+        );
+        assert_eq!(
+            category_for("readability", "found 4 TODO/FIXME markers"),
+            "Hygiene"
+        );
+        assert_eq!(
+            category_for(
+                "readability",
+                "file is over the configured limit (480 > 400 lines)"
+            ),
+            "Readability"
+        );
+        assert_eq!(
+            category_for("testability", "test indicators below minimum"),
+            "Testing"
+        );
+        assert_eq!(
+            category_for("performance", "found 37 clone call(s)"),
+            "Performance"
+        );
+    }
 }

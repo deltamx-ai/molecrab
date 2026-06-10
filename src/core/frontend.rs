@@ -741,6 +741,9 @@ fn analyze_body(body: Option<BodyRef>, type_anns: &[&TsType]) -> (usize, usize, 
         then_calls: visitor.then_calls,
         catch_calls: visitor.catch_calls,
         use_effect_missing_deps: visitor.use_effect_missing_deps,
+        set_state_in_effect: visitor.set_state_in_effect,
+        memo_missing_deps: visitor.memo_missing_deps,
+        jsx_inline_handlers: visitor.jsx_inline_handlers,
         // `unsafe` is a Rust concept; it never applies to a frontend function.
         unsafe_count: 0,
     };
@@ -766,6 +769,9 @@ struct BodyVisitor {
     then_calls: usize,
     catch_calls: usize,
     use_effect_missing_deps: usize,
+    set_state_in_effect: usize,
+    memo_missing_deps: usize,
+    jsx_inline_handlers: usize,
 }
 
 impl BodyVisitor {
@@ -935,9 +941,21 @@ impl Visit for BodyVisitor {
                             self.subscribe_cleanup = true
                         }
                         // A React effect hook with no dependency-array argument
-                        // re-runs on every render — a frequent bug source.
-                        "useEffect" | "useLayoutEffect" if node.args.len() < 2 => {
-                            self.use_effect_missing_deps += 1
+                        // re-runs on every render — a frequent bug source. The
+                        // callback is also scanned for state setters, which point
+                        // at infinite-render loops.
+                        "useEffect" | "useLayoutEffect" => {
+                            if node.args.len() < 2 {
+                                self.use_effect_missing_deps += 1;
+                            }
+                            if let Some(first) = node.args.first() {
+                                self.set_state_in_effect += count_set_state_calls(&first.expr);
+                            }
+                        }
+                        // A memo hook with no dependency array recomputes every
+                        // render, defeating the point of memoizing.
+                        "useMemo" | "useCallback" if node.args.len() < 2 => {
+                            self.memo_missing_deps += 1
                         }
                         _ => {}
                     }
@@ -971,6 +989,18 @@ impl Visit for BodyVisitor {
         node.visit_children_with(self);
     }
 
+    fn visit_jsx_attr(&mut self, node: &JSXAttr) {
+        // An inline arrow/function as a JSX attribute value (`onClick={() => …}`)
+        // is a fresh closure on every render — can defeat child memoization.
+        if let Some(JSXAttrValue::JSXExprContainer(container)) = &node.value
+            && let JSXExpr::Expr(expr) = &container.expr
+            && matches!(&**expr, Expr::Arrow(_) | Expr::Fn(_))
+        {
+            self.jsx_inline_handlers += 1;
+        }
+        node.visit_children_with(self);
+    }
+
     fn visit_ident(&mut self, node: &Ident) {
         if matches!(node.sym.as_str(), "Subscription" | "DestroyRef") {
             self.subscribe_cleanup = true;
@@ -978,6 +1008,55 @@ impl Visit for BodyVisitor {
     }
 
     // Each function is measured on its own — do not descend into nested ones.
+    fn visit_function(&mut self, _: &Function) {}
+    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+}
+
+/// Counts `setX(...)` state-setter calls inside a `useEffect` callback. The
+/// callback (`arg0`) is normally a function we'd otherwise skip, so this walks it
+/// explicitly — but it still stops at any *further* nested function so only the
+/// effect's own top level is measured.
+fn count_set_state_calls(callback: &Expr) -> usize {
+    let mut visitor = SetStateVisitor { count: 0 };
+    match callback {
+        Expr::Arrow(arrow) => match &*arrow.body {
+            BlockStmtOrExpr::BlockStmt(block) => block.visit_with(&mut visitor),
+            BlockStmtOrExpr::Expr(expr) => expr.visit_with(&mut visitor),
+        },
+        Expr::Fn(fn_expr) => {
+            if let Some(body) = &fn_expr.function.body {
+                body.visit_with(&mut visitor);
+            }
+        }
+        _ => {}
+    }
+    visitor.count
+}
+
+/// A `setX`-style identifier: `set` followed by an upper-case letter — the React
+/// `useState` setter naming convention.
+fn is_state_setter(name: &str) -> bool {
+    name.strip_prefix("set")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| c.is_ascii_uppercase())
+}
+
+struct SetStateVisitor {
+    count: usize,
+}
+
+impl Visit for SetStateVisitor {
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        if let Callee::Expr(callee) = &node.callee
+            && let Expr::Ident(id) = &**callee
+            && is_state_setter(id.sym.as_str())
+        {
+            self.count += 1;
+        }
+        node.visit_children_with(self);
+    }
+
+    // Do not look inside further nested functions — only the effect body itself.
     fn visit_function(&mut self, _: &Function) {}
     fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
 }
@@ -1073,6 +1152,7 @@ fn scan_stylesheet(file: &FileSnapshot, content: &str) -> StylesheetSnapshot {
     let mut import_count = 0usize;
     let mut max_nesting_depth = 0usize;
     let mut largest_rule_lines = 0usize;
+    let mut important_count = 0usize;
     let mut brace_depth = 0usize;
     let mut block_starts: Vec<usize> = Vec::new();
     let mut selector_occurrences: HashMap<String, usize> = HashMap::new();
@@ -1082,6 +1162,8 @@ fn scan_stylesheet(file: &FileSnapshot, content: &str) -> StylesheetSnapshot {
         if line.is_empty() || line.starts_with("/*") || line.starts_with('*') {
             continue;
         }
+
+        important_count += line.matches("!important").count();
 
         let is_at_rule = line.starts_with('@');
         if is_at_rule
@@ -1149,6 +1231,7 @@ fn scan_stylesheet(file: &FileSnapshot, content: &str) -> StylesheetSnapshot {
         max_nesting_depth,
         largest_rule_lines,
         duplicate_selector_count,
+        important_count,
     }
 }
 
@@ -1395,5 +1478,38 @@ mod tests {
         let functions = scan_functions(&file("C.tsx", src), src);
         let c = function(&functions, "C");
         assert_eq!(c.signals.use_effect_missing_deps, 0);
+    }
+
+    #[test]
+    fn detects_set_state_inside_effect() {
+        let src = "function C() { useEffect(() => { setCount(1); load(); }, []); }";
+        let functions = scan_functions(&file("C.tsx", src), src);
+        let c = function(&functions, "C");
+        assert_eq!(c.signals.set_state_in_effect, 1);
+    }
+
+    #[test]
+    fn detects_memo_without_deps() {
+        let src = "function C() { const v = useMemo(() => compute()); const cb = useCallback(() => go(), []); return v; }";
+        let functions = scan_functions(&file("C.tsx", src), src);
+        let c = function(&functions, "C");
+        // useMemo has no deps (flagged); useCallback has `[]` (not flagged).
+        assert_eq!(c.signals.memo_missing_deps, 1);
+    }
+
+    #[test]
+    fn counts_inline_jsx_handlers() {
+        let src = "function C() { return <button onClick={() => save()}>x</button>; }";
+        let functions = scan_functions(&file("C.tsx", src), src);
+        let c = function(&functions, "C");
+        assert_eq!(c.signals.jsx_inline_handlers, 1);
+    }
+
+    #[test]
+    fn stylesheet_counts_important() {
+        let css =
+            ".a { color: red !important; }\n.b { margin: 0 !important; padding: 0 !important; }\n";
+        let sheets = scan_stylesheets(std::slice::from_ref(&file("s.css", css)));
+        assert_eq!(sheets[0].important_count, 3);
     }
 }

@@ -2,6 +2,7 @@ pub mod classify;
 pub mod config;
 pub mod doctor;
 pub mod frontend;
+pub mod frontend_profile;
 pub mod lint;
 pub mod metrics;
 pub mod model;

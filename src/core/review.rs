@@ -11,9 +11,10 @@ use super::classify::FileCategory;
 use super::config::ReviewConfig;
 use super::metrics;
 use super::model::{
-    AreaHealth, CategoryCount, FileRanking, Finding, FunctionRanking, FunctionSnapshot,
-    FunctionSummary, LanguageCount, MetricResult, Priority, RepositorySnapshot, ReviewReport,
-    ReviewScope, Severity, StylesheetRanking, area_of, is_dead_code_candidate,
+    AreaHealth, CategoryCount, FileRanking, Finding, FrontendKind, FrontendProfile,
+    FunctionRanking, FunctionSnapshot, FunctionSummary, LanguageCount, MetricResult, Priority,
+    RepositorySnapshot, ReviewReport, ReviewScope, Severity, StylesheetRanking, area_of,
+    is_dead_code_candidate,
 };
 use super::scanner;
 
@@ -99,6 +100,7 @@ fn build_report(
     let grade = grade_for(overall).to_string();
     let passed = overall >= config.thresholds.overall_score;
     let verdict = verdict_label(&grade, &metrics, config.thresholds.failing_metric_score);
+    let risk_level = risk_level_for(&findings);
     let worst_metric = metrics
         .iter()
         .min_by_key(|metric| metric.score)
@@ -147,6 +149,7 @@ fn build_report(
         overall,
         grade,
         verdict,
+        risk_level,
         passed,
         worst_metric,
         issue_categories,
@@ -159,6 +162,29 @@ fn build_report(
         most_notable,
         stylesheet_rankings,
         git,
+        frontend: snapshot.frontend.clone(),
+    }
+}
+
+/// Coarse correctness-risk level from the safety findings: an error-severity risk
+/// (or several warnings) is "high", any warning-level risk is "moderate", and
+/// info-only / none is "low".
+fn risk_level_for(findings: &[Finding]) -> &'static str {
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    for finding in findings.iter().filter(|f| is_risk_category(f.category)) {
+        match finding.severity {
+            Severity::Error => errors += 1,
+            Severity::Warning => warnings += 1,
+            Severity::Info => {}
+        }
+    }
+    if errors > 0 || warnings >= 5 {
+        "high"
+    } else if warnings > 0 {
+        "moderate"
+    } else {
+        "low"
     }
 }
 
@@ -842,6 +868,7 @@ fn rank_stylesheets(
             max_nesting_depth: sheet.max_nesting_depth,
             largest_rule_lines: sheet.largest_rule_lines,
             duplicate_selector_count: sheet.duplicate_selector_count,
+            important_count: sheet.important_count,
         })
         .collect::<Vec<_>>();
 
@@ -880,6 +907,7 @@ fn render_text_report(report: &ReviewReport) -> String {
     render_scores(&mut out, report);
     render_areas(&mut out, report);
     render_functions(&mut out, report);
+    render_frontend(&mut out, report);
     render_details(&mut out, report);
     out
 }
@@ -924,6 +952,22 @@ fn render_summary(out: &mut String, report: &ReviewReport) {
         paint_grade(&report.grade),
         verdict_colored,
     );
+
+    // Frontend project kind + correctness-risk level — only when there is a
+    // frontend to talk about.
+    if report.frontend.kind != FrontendKind::NonFrontend {
+        let risk = match report.risk_level {
+            "high" => report.risk_level.red().bold(),
+            "moderate" => report.risk_level.yellow().bold(),
+            _ => report.risk_level.green().bold(),
+        };
+        let _ = writeln!(
+            out,
+            "  Frontend {}   risk {}",
+            report.frontend.kind.label().bold().cyan(),
+            risk,
+        );
+    }
 
     let gate = if report.passed {
         format!("gate PASSED (>={})", report.config.thresholds.overall_score)
@@ -1237,6 +1281,86 @@ fn render_notable_function(out: &mut String, func: &FunctionRanking) {
     );
 }
 
+/// A dedicated frontend block: project kind + the framework-specific evidence,
+/// a one-line TS/JS function-health recap, and a CSS/SCSS recap. Skipped for
+/// non-frontend repos so a pure backend project never sees it.
+fn render_frontend(out: &mut String, report: &ReviewReport) {
+    let fp = &report.frontend;
+    if fp.kind == FrontendKind::NonFrontend {
+        return;
+    }
+    heading(out, "Frontend");
+    let _ = writeln!(
+        out,
+        "  {} · {} script file(s) · risk {}",
+        fp.kind.label().bold(),
+        fp.script_files,
+        report.risk_level,
+    );
+
+    if fp.kind.is_react() {
+        let _ = writeln!(
+            out,
+            "  {}  hooks {} · jsx/tsx files {} · react dep {}",
+            "React".bold(),
+            fp.react_hooks,
+            fp.jsx_files,
+            yes_no(fp.react_dependency),
+        );
+    }
+    if fp.kind.is_angular() {
+        let _ = writeln!(
+            out,
+            "  {}  decorators {} · templates {} · DI constructors {} · angular dep {}",
+            "Angular".bold(),
+            fp.angular_decorators,
+            fp.html_templates,
+            fp.di_constructors,
+            yes_no(fp.angular_dependency),
+        );
+    }
+
+    let summary = &report.function_summary;
+    if summary.function_count > 0 {
+        let _ = writeln!(
+            out,
+            "  {}  {} fns · {} long · {} complex · avg cc {:.1}",
+            "Functions".bold(),
+            summary.function_count,
+            summary.long_function_count,
+            summary.complex_function_count,
+            summary.average_cyclomatic,
+        );
+    }
+
+    if !report.stylesheet_rankings.is_empty() {
+        let important: usize = report
+            .stylesheet_rankings
+            .iter()
+            .map(|s| s.important_count)
+            .sum();
+        let max_nesting = report
+            .stylesheet_rankings
+            .iter()
+            .map(|s| s.max_nesting_depth)
+            .max()
+            .unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "  {}  {} sheet(s) ranked · {} !important · max nesting {}",
+            "CSS".bold(),
+            report.stylesheet_rankings.len(),
+            important,
+            max_nesting,
+        );
+    }
+    let _ = writeln!(out);
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
 /// Each line respects its observability config toggle; the whole block is
 /// skipped if nothing is enabled or available.
 fn render_details(out: &mut String, report: &ReviewReport) {
@@ -1407,7 +1531,7 @@ fn base_name(path: &str) -> &str {
 
 /// Version of the JSON report contract. Bump on any breaking shape change so
 /// service consumers can branch on it.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1426,6 +1550,8 @@ struct JsonReviewReport {
     /// Findings ingested from an external linter (ESLint). Kept separate from
     /// metric findings because they do not affect the scores.
     lint_findings: Vec<Finding>,
+    /// Frontend classification + evidence (React / Angular / Mixed / …).
+    frontend: FrontendProfile,
     observability: JsonObservability,
 }
 
@@ -1444,6 +1570,7 @@ struct JsonSummary {
     score: u8,
     grade: String,
     verdict: String,
+    risk_level: &'static str,
     passed: bool,
     gate_threshold: u8,
     weakest_metric: Option<&'static str>,
@@ -1479,6 +1606,7 @@ impl JsonReviewReport {
                 score: report.overall,
                 grade: report.grade.clone(),
                 verdict: report.verdict.to_string(),
+                risk_level: report.risk_level,
                 passed: report.passed,
                 gate_threshold: report.config.thresholds.overall_score,
                 weakest_metric: report.worst_metric,
@@ -1497,6 +1625,7 @@ impl JsonReviewReport {
                 .cloned()
                 .collect(),
             lint_findings: report.lint_findings.clone(),
+            frontend: report.frontend.clone(),
             observability: JsonObservability {
                 function_summary: report.function_summary.clone(),
                 function_rankings: JsonFunctionRankings {

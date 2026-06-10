@@ -38,6 +38,10 @@ pub enum RuleLang {
     Rust,
     /// Needs frontend (TS/JS) signals (subscriptions, console, expressions).
     Frontend,
+    /// React-specific — runs only when the project is classified React/Mixed.
+    React,
+    /// Angular-specific — runs only when the project is classified Angular/Mixed.
+    Angular,
 }
 
 /// One raw detection produced by a rule, before it is stamped with rule metadata.
@@ -65,7 +69,7 @@ pub struct Rule {
 
 /// The single registry of every built-in rule.
 pub fn builtin_rules() -> Vec<Rule> {
-    use RuleLang::{Common, Frontend, Rust};
+    use RuleLang::{Angular, Common, Frontend, React, Rust};
     use Severity::{Info, Warning};
     vec![
         // ---- Common (language-agnostic) ----
@@ -239,13 +243,63 @@ pub fn builtin_rules() -> Vec<Rule> {
             severity: Warning,
             check: rule_unhandled_promise,
         },
+        // ---- React (only when the project is React/Mixed) ----
         Rule {
             id: "react-effect-deps",
-            lang: Frontend,
+            lang: React,
             metric: "robustness",
             category: "React",
             severity: Warning,
             check: rule_react_effect_deps,
+        },
+        Rule {
+            id: "react-state-in-effect",
+            lang: React,
+            metric: "robustness",
+            category: "React",
+            severity: Warning,
+            check: rule_react_state_in_effect,
+        },
+        Rule {
+            id: "react-memo-deps",
+            lang: React,
+            metric: "performance",
+            category: "React",
+            severity: Info,
+            check: rule_react_memo_deps,
+        },
+        Rule {
+            id: "react-jsx-inline-handlers",
+            lang: React,
+            metric: "performance",
+            category: "React",
+            severity: Info,
+            check: rule_react_jsx_inline_handlers,
+        },
+        // ---- Angular (only when the project is Angular/Mixed) ----
+        Rule {
+            id: "angular-ctor-injection",
+            lang: Angular,
+            metric: "maintainability",
+            category: "Angular",
+            severity: Info,
+            check: rule_angular_ctor_injection,
+        },
+        Rule {
+            id: "angular-god-class",
+            lang: Angular,
+            metric: "maintainability",
+            category: "Angular",
+            severity: Warning,
+            check: rule_angular_god_class,
+        },
+        Rule {
+            id: "angular-template-binding",
+            lang: Angular,
+            metric: "robustness",
+            category: "Angular",
+            severity: Warning,
+            check: rule_angular_template_binding,
         },
         // NOTE: `magic-number` is intentionally not implemented yet — a reliable
         // cross-language numeric-literal signal is more work than it is worth for
@@ -253,13 +307,17 @@ pub fn builtin_rules() -> Vec<Rule> {
     ]
 }
 
-/// Whether a rule runs under the current config: its language group must be on
-/// and its id must not be in the `disable` list.
-fn is_enabled(rule: &Rule, config: &ReviewConfig) -> bool {
+/// Whether a rule runs: its language-group toggle must be on, the project kind
+/// must match (React/Angular rules only fire on a matching project), and its id
+/// must not be in the `disable` list.
+fn is_enabled(rule: &Rule, snapshot: &RepositorySnapshot, config: &ReviewConfig) -> bool {
+    let kind = snapshot.frontend.kind;
     let group_on = match rule.lang {
         RuleLang::Common => config.rules.common,
         RuleLang::Rust => config.rules.rust,
         RuleLang::Frontend => config.rules.frontend,
+        RuleLang::React => config.rules.react && kind.is_react(),
+        RuleLang::Angular => config.rules.angular && kind.is_angular(),
     };
     group_on && !config.rules.disable.iter().any(|id| id == rule.id)
 }
@@ -269,7 +327,7 @@ fn is_enabled(rule: &Rule, config: &ReviewConfig) -> bool {
 pub fn evaluate(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Vec<Finding> {
     let mut findings = Vec::new();
     for rule in builtin_rules() {
-        if !is_enabled(&rule, config) {
+        if !is_enabled(&rule, snapshot, config) {
             continue;
         }
         let mut hits = (rule.check)(snapshot, config);
@@ -861,6 +919,186 @@ fn rule_react_effect_deps(snapshot: &RepositorySnapshot, _config: &ReviewConfig)
         .collect()
 }
 
+/// A state setter called directly in a `useEffect` body — the classic cause of
+/// an infinite render loop (effect sets state → re-render → effect runs again).
+fn rule_react_state_in_effect(
+    snapshot: &RepositorySnapshot,
+    _config: &ReviewConfig,
+) -> Vec<RuleHit> {
+    snapshot
+        .functions
+        .iter()
+        .filter(|f| f.signals.set_state_in_effect > 0)
+        .map(|f| {
+            fn_hit(
+                f,
+                format!(
+                    "`{}` sets state inside useEffect ({}x) — risks an infinite render loop",
+                    f.name, f.signals.set_state_in_effect
+                ),
+                "guard the setter with a condition, or derive the value without state",
+                4,
+            )
+        })
+        .collect()
+}
+
+fn rule_react_memo_deps(snapshot: &RepositorySnapshot, _config: &ReviewConfig) -> Vec<RuleHit> {
+    snapshot
+        .functions
+        .iter()
+        .filter(|f| f.signals.memo_missing_deps > 0)
+        .map(|f| {
+            fn_hit(
+                f,
+                format!(
+                    "`{}` uses useMemo/useCallback with no dependency array ({}x) — recomputed every render",
+                    f.name, f.signals.memo_missing_deps
+                ),
+                "add a dependency array, or drop the memoization if it adds no value",
+                2,
+            )
+        })
+        .collect()
+}
+
+fn rule_react_jsx_inline_handlers(
+    snapshot: &RepositorySnapshot,
+    config: &ReviewConfig,
+) -> Vec<RuleHit> {
+    let max = config.thresholds.max_jsx_inline_handlers as usize;
+    snapshot
+        .functions
+        .iter()
+        .filter(|f| f.signals.jsx_inline_handlers > max)
+        .map(|f| {
+            fn_hit(
+                f,
+                format!(
+                    "`{}` has many inline JSX handlers ({}, limit {}) — fresh closures each render",
+                    f.name, f.signals.jsx_inline_handlers, max
+                ),
+                "hoist handlers or wrap them in useCallback to keep references stable",
+                2,
+            )
+        })
+        .collect()
+}
+
+/// Angular constructor dependency-injection count. Pure observation: it is
+/// emitted with a **zero penalty** so it never affects the score — a fat
+/// constructor is a smell worth seeing, not a defect to deduct for.
+fn rule_angular_ctor_injection(
+    snapshot: &RepositorySnapshot,
+    config: &ReviewConfig,
+) -> Vec<RuleHit> {
+    let max = config.thresholds.max_constructor_params as usize;
+    snapshot
+        .functions
+        .iter()
+        .filter(|f| f.name.ends_with("::constructor") && f.param_count > max)
+        .map(|f| {
+            let class = f.name.strip_suffix("::constructor").unwrap_or(&f.name);
+            RuleHit {
+                file: Some(f.file.clone()),
+                line: Some(f.start_line),
+                message: format!(
+                    "`{}` injects {} dependencies (over {}) — possibly over-broad responsibility",
+                    class, f.param_count, max
+                ),
+                suggestion: "consider splitting the class or grouping related deps".to_string(),
+                penalty: 0,
+            }
+        })
+        .collect()
+}
+
+/// A class with too many methods — a fat component / service doing too much.
+/// Methods are counted from the `Class::method` naming the frontend layer emits.
+fn rule_angular_god_class(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Vec<RuleHit> {
+    let max = config.thresholds.max_class_methods as usize;
+    let mut methods: std::collections::HashMap<&str, (usize, &str, usize)> =
+        std::collections::HashMap::new();
+    for func in &snapshot.functions {
+        let Some((class, _)) = func.name.split_once("::") else {
+            continue;
+        };
+        let entry = methods
+            .entry(class)
+            .or_insert((0, func.file.as_str(), func.start_line));
+        entry.0 += 1;
+    }
+    let mut hits: Vec<RuleHit> = methods
+        .into_iter()
+        .filter(|(_, (count, _, _))| *count > max)
+        .map(|(class, (count, file, line))| RuleHit {
+            file: Some(file.to_string()),
+            line: Some(line),
+            message: format!(
+                "class `{}` has {} methods (over {}) — doing too much",
+                class, count, max
+            ),
+            suggestion: "split responsibilities into smaller components/services".to_string(),
+            penalty: ((count - max) as u32 + 2).min(10),
+        })
+        .collect();
+    hits.sort_by(|a, b| b.penalty.cmp(&a.penalty));
+    hits
+}
+
+/// Angular template ↔ component matching: an event handler bound in a `.html`
+/// template whose name the sibling component never declares. Heuristic but
+/// low-false-positive — it only flags handlers that appear *nowhere* in the
+/// component source (typos, renames, handlers on the wrong component).
+fn rule_angular_template_binding(
+    snapshot: &RepositorySnapshot,
+    _config: &ReviewConfig,
+) -> Vec<RuleHit> {
+    use super::frontend_profile::{
+        sibling_component_path, template_event_handlers, ts_has_identifier,
+    };
+
+    let find_content = |path: &str| {
+        snapshot
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .and_then(|f| f.content.as_deref())
+    };
+
+    let mut hits = Vec::new();
+    for file in &snapshot.files {
+        if !file.name.ends_with(".html") || file.category.is_noise() {
+            continue;
+        }
+        let Some(html) = file.content.as_deref() else {
+            continue;
+        };
+        let Some(ts_path) = sibling_component_path(&file.path) else {
+            continue;
+        };
+        let Some(ts) = find_content(&ts_path) else {
+            continue; // standalone template (no paired component) — skip.
+        };
+        for (handler, line) in template_event_handlers(html) {
+            if !ts_has_identifier(ts, &handler) {
+                hits.push(RuleHit {
+                    file: Some(file.path.clone()),
+                    line: Some(line),
+                    message: format!(
+                        "template binds an event to `{}` which the component does not define",
+                        handler
+                    ),
+                    suggestion: "fix the handler name, or add the method to the component"
+                        .to_string(),
+                    penalty: 5,
+                });
+            }
+        }
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,6 +1138,17 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    /// A snapshot already classified as a given frontend kind, so framework-gated
+    /// rules (React/Angular) are eligible to run.
+    fn snapshot_kind(
+        functions: Vec<FunctionSnapshot>,
+        kind: crate::core::model::FrontendKind,
+    ) -> RepositorySnapshot {
+        let mut snap = snapshot(functions);
+        snap.frontend.kind = kind;
+        snap
     }
 
     #[test]
@@ -1031,16 +1280,84 @@ mod tests {
 
     #[test]
     fn use_effect_without_deps_is_react_risk() {
+        use crate::core::model::FrontendKind;
         let signals = FunctionSignals {
             use_effect_missing_deps: 1,
             ..FunctionSignals::default()
         };
-        let snap = snapshot(vec![func("Widget", 5, 1, signals)]);
+        let snap = snapshot_kind(vec![func("Widget", 5, 1, signals)], FrontendKind::React);
         let findings = evaluate(&snap, &ReviewConfig::default());
         assert!(
             findings
                 .iter()
                 .any(|f| f.rule == Some("react-effect-deps") && f.category == "React")
         );
+    }
+
+    #[test]
+    fn react_rules_do_not_fire_on_non_react_projects() {
+        use crate::core::model::FrontendKind;
+        let signals = FunctionSignals {
+            use_effect_missing_deps: 1,
+            set_state_in_effect: 1,
+            ..FunctionSignals::default()
+        };
+        // Same signals, but an Angular project: React rules must stay silent.
+        let snap = snapshot_kind(vec![func("thing", 5, 1, signals)], FrontendKind::Angular);
+        let findings = evaluate(&snap, &ReviewConfig::default());
+        assert!(!findings.iter().any(|f| f.rule == Some("react-effect-deps")));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule == Some("react-state-in-effect"))
+        );
+    }
+
+    #[test]
+    fn angular_ctor_injection_is_info_with_zero_penalty() {
+        use crate::core::model::FrontendKind;
+        let mut ctor = func("UserService::constructor", 3, 1, FunctionSignals::default());
+        ctor.param_count = 7;
+        let snap = snapshot_kind(vec![ctor], FrontendKind::Angular);
+        let findings = evaluate(&snap, &ReviewConfig::default());
+        let f = findings
+            .iter()
+            .find(|f| f.rule == Some("angular-ctor-injection"))
+            .expect("angular-ctor-injection should fire");
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.score_penalty, 0); // observation only — never deducts.
+    }
+
+    #[test]
+    fn angular_template_binding_flags_unknown_handler() {
+        use crate::core::classify::FileCategory;
+        use crate::core::model::{FileSnapshot, FrontendKind};
+        let html = FileSnapshot {
+            path: "src/a.component.html".to_string(),
+            name: "a.component.html".to_string(),
+            lines: 1,
+            bytes: 0,
+            depth: 2,
+            category: FileCategory::Source,
+            content: Some("<button (click)=\"missingHandler()\">x</button>".to_string()),
+        };
+        let ts = FileSnapshot {
+            path: "src/a.component.ts".to_string(),
+            name: "a.component.ts".to_string(),
+            lines: 1,
+            bytes: 0,
+            depth: 2,
+            category: FileCategory::Source,
+            content: Some("export class A { realHandler() {} }".to_string()),
+        };
+        let mut snap = snapshot_kind(Vec::new(), FrontendKind::Angular);
+        snap.files = vec![html, ts];
+        let findings = evaluate(&snap, &ReviewConfig::default());
+        let f = findings
+            .iter()
+            .find(|f| f.rule == Some("angular-template-binding"))
+            .expect("angular-template-binding should fire");
+        assert!(f.message.contains("missingHandler"));
+        assert_eq!(f.line, Some(1));
     }
 }

@@ -24,6 +24,9 @@ use std::path::{Path, PathBuf};
 /// max_ternary_depth = 2
 /// max_as_casts = 3
 /// max_non_null_assertions = 2
+/// max_constructor_params = 4
+/// max_class_methods = 15
+/// max_jsx_inline_handlers = 3
 /// max_unwrap_count = 2
 /// max_expect_count = 2
 /// max_panic_count = 0
@@ -59,6 +62,8 @@ use std::path::{Path, PathBuf};
 /// rust = true
 /// frontend = true
 /// common = true
+/// react = true
+/// angular = true
 /// disable = ["excessive-clone"]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
@@ -86,6 +91,9 @@ pub struct ReviewThresholds {
     pub max_ternary_depth: u32,
     pub max_as_casts: u32,
     pub max_non_null_assertions: u32,
+    pub max_constructor_params: u32,
+    pub max_class_methods: u32,
+    pub max_jsx_inline_handlers: u32,
     pub max_unwrap_count: u32,
     pub max_expect_count: u32,
     pub max_panic_count: u32,
@@ -129,6 +137,10 @@ pub struct RulesConfig {
     pub rust: bool,
     /// Run frontend (TS/JS) rules (subscribe leaks, empty catch, console, …).
     pub frontend: bool,
+    /// Run React-specific rules — only when the project is classified React/Mixed.
+    pub react: bool,
+    /// Run Angular-specific rules — only when the project is classified Angular/Mixed.
+    pub angular: bool,
     /// Rule ids to switch off individually, overriding the group toggles.
     pub disable: Vec<String>,
 }
@@ -139,6 +151,8 @@ impl Default for RulesConfig {
             common: true,
             rust: true,
             frontend: true,
+            react: true,
+            angular: true,
             disable: Vec::new(),
         }
     }
@@ -181,6 +195,9 @@ impl Default for ReviewThresholds {
             max_ternary_depth: 2,
             max_as_casts: 3,
             max_non_null_assertions: 2,
+            max_constructor_params: 4,
+            max_class_methods: 15,
+            max_jsx_inline_handlers: 3,
             max_unwrap_count: 2,
             max_expect_count: 2,
             max_panic_count: 0,

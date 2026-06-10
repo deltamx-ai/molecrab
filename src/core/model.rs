@@ -156,6 +156,15 @@ pub struct FunctionSignals {
     /// `useEffect` / `useLayoutEffect` calls with no dependency array argument
     /// (React, AST) — runs every render, a common bug source.
     pub use_effect_missing_deps: usize,
+    /// State setters (`setX(...)`) called directly inside a `useEffect` body
+    /// (React, AST) — a frequent infinite-render-loop smell.
+    pub set_state_in_effect: usize,
+    /// `useMemo` / `useCallback` calls with no dependency array (React, AST) —
+    /// the memo is recomputed every render, defeating its purpose.
+    pub memo_missing_deps: usize,
+    /// Inline arrow/function handlers passed in JSX attributes (React, AST) — a
+    /// fresh closure each render that can defeat child memoization.
+    pub jsx_inline_handlers: usize,
 }
 
 /// A single file that references a function, and how many times.
@@ -191,6 +200,8 @@ pub struct StylesheetSnapshot {
     pub max_nesting_depth: usize,
     pub largest_rule_lines: usize,
     pub duplicate_selector_count: usize,
+    /// `!important` declarations — a specificity-war smell when frequent.
+    pub important_count: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -231,6 +242,82 @@ pub struct RepositorySnapshot {
     pub functions: Vec<FunctionSnapshot>,
     pub stylesheets: Vec<StylesheetSnapshot>,
     pub git: Option<GitSnapshot>,
+    /// What kind of frontend project this is, with the evidence behind the call.
+    /// Drives which framework-specific rules run (`core::rules`).
+    pub frontend: FrontendProfile,
+}
+
+/// The kind of frontend project, decided by `core::frontend_profile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendKind {
+    React,
+    Angular,
+    /// Both React and Angular signals are present.
+    Mixed,
+    /// TS/JS present, but no React/Angular markers.
+    Generic,
+    /// No meaningful frontend code.
+    NonFrontend,
+}
+
+impl FrontendKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            FrontendKind::React => "React",
+            FrontendKind::Angular => "Angular",
+            FrontendKind::Mixed => "Mixed (React + Angular)",
+            FrontendKind::Generic => "Generic TS/JS",
+            FrontendKind::NonFrontend => "Non-frontend",
+        }
+    }
+
+    pub fn is_react(self) -> bool {
+        matches!(self, FrontendKind::React | FrontendKind::Mixed)
+    }
+
+    pub fn is_angular(self) -> bool {
+        matches!(self, FrontendKind::Angular | FrontendKind::Mixed)
+    }
+}
+
+/// Classification result plus the raw evidence that produced it, so the report
+/// can explain *why* a project was called React / Angular / etc.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FrontendProfile {
+    pub kind: FrontendKind,
+    /// `react` / `react-dom` / `next` / `@types/react` seen in a package.json.
+    pub react_dependency: bool,
+    /// Hook call sites (`useState` / `useEffect` / `useMemo` / `useCallback` / `useRef`).
+    pub react_hooks: usize,
+    /// `.tsx` / `.jsx` files.
+    pub jsx_files: usize,
+    /// `@angular/core` seen in a package.json, or an `angular.json` present.
+    pub angular_dependency: bool,
+    /// Angular decorators (`@Component` / `@Injectable` / `@NgModule` / `@Directive` / `@Pipe`).
+    pub angular_decorators: usize,
+    /// `.html` template files.
+    pub html_templates: usize,
+    /// Constructors that inject at least one dependency.
+    pub di_constructors: usize,
+    /// First-party script files (TS/JS/TSX/JSX) analyzed.
+    pub script_files: usize,
+}
+
+impl Default for FrontendProfile {
+    fn default() -> Self {
+        Self {
+            kind: FrontendKind::NonFrontend,
+            react_dependency: false,
+            react_hooks: 0,
+            jsx_files: 0,
+            angular_dependency: false,
+            angular_decorators: 0,
+            html_templates: 0,
+            di_constructors: 0,
+            script_files: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -329,6 +416,9 @@ pub struct ReviewReport {
     pub overall: u8,
     pub grade: String,
     pub verdict: &'static str,
+    /// Coarse correctness-risk level derived from the safety findings:
+    /// "low" / "moderate" / "high".
+    pub risk_level: &'static str,
     pub passed: bool,
     pub worst_metric: Option<&'static str>,
     pub issue_categories: Vec<CategoryCount>,
@@ -343,6 +433,8 @@ pub struct ReviewReport {
     pub most_notable: Vec<FunctionRanking>,
     pub stylesheet_rankings: Vec<StylesheetRanking>,
     pub git: Option<GitSnapshot>,
+    /// Frontend project classification + evidence (drives the Frontend section).
+    pub frontend: FrontendProfile,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -416,6 +508,7 @@ pub struct StylesheetRanking {
     pub max_nesting_depth: usize,
     pub largest_rule_lines: usize,
     pub duplicate_selector_count: usize,
+    pub important_count: usize,
 }
 
 impl RepositoryProfile {
@@ -470,6 +563,9 @@ impl RepositorySnapshot {
             functions,
             stylesheets,
             git,
+            // The scanner fills this in after classification; tests and other
+            // callers get a Non-frontend default.
+            frontend: FrontendProfile::default(),
         }
     }
 

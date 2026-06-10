@@ -29,6 +29,7 @@ pub fn scan_repository(root: &Path, config: &ReviewConfig) -> Result<RepositoryS
     let functions = annotate_references(collect_functions(&files), &files);
     let stylesheets = frontend::scan_stylesheets(&files);
     let git = collect_git_snapshot(root, config);
+    let frontend = super::frontend_profile::classify(&files, &functions);
 
     let file_count = files.len();
     let source_file_count = files.iter().filter(|f| f.is_source()).count();
@@ -42,13 +43,9 @@ pub fn scan_repository(root: &Path, config: &ReviewConfig) -> Result<RepositoryS
         total_lines,
     );
 
-    Ok(RepositorySnapshot::new(
-        profile,
-        files,
-        functions,
-        stylesheets,
-        git,
-    ))
+    let mut snapshot = RepositorySnapshot::new(profile, files, functions, stylesheets, git);
+    snapshot.frontend = frontend;
+    Ok(snapshot)
 }
 
 fn visit_path(

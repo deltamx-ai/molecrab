@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 /// max_function_params = 5
 /// max_cyclomatic = 10
 /// max_function_nesting = 4
+/// max_bool_operands = 4
+/// max_ternary_depth = 2
+/// max_as_casts = 3
+/// max_non_null_assertions = 2
 /// max_unwrap_count = 2
 /// max_expect_count = 2
 /// max_panic_count = 0
@@ -50,6 +54,12 @@ use std::path::{Path, PathBuf};
 /// commit_concentration = true
 /// most_recent_active_authors = true
 /// code_change_hotspots = true
+///
+/// [rules]
+/// rust = true
+/// frontend = true
+/// common = true
+/// disable = ["excessive-clone"]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
 #[serde(default)]
@@ -57,6 +67,7 @@ pub struct ReviewConfig {
     pub thresholds: ReviewThresholds,
     pub observability: ObservabilityTargets,
     pub classification: ClassificationConfig,
+    pub rules: RulesConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -71,6 +82,10 @@ pub struct ReviewThresholds {
     pub max_function_params: u32,
     pub max_cyclomatic: u32,
     pub max_function_nesting: u32,
+    pub max_bool_operands: u32,
+    pub max_ternary_depth: u32,
+    pub max_as_casts: u32,
+    pub max_non_null_assertions: u32,
     pub max_unwrap_count: u32,
     pub max_expect_count: u32,
     pub max_panic_count: u32,
@@ -97,6 +112,36 @@ pub struct ClassificationConfig {
     pub extra_generated: Vec<String>,
     /// Extra directory names treated as vendored / ignored.
     pub extra_ignored_dirs: Vec<String>,
+}
+
+/// Which rule groups (`core::rules`) are active, plus per-rule opt-outs.
+///
+/// Rules are grouped by the language layer they target: `common` rules work on
+/// any function/file, `rust` and `frontend` rules need language-specific
+/// signals. Each group can be turned off wholesale; `disable` then switches off
+/// individual rules by id (e.g. `"excessive-clone"`) regardless of group.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct RulesConfig {
+    /// Run language-agnostic rules (size / complexity / dead code / hygiene).
+    pub common: bool,
+    /// Run Rust-specific rules (unsafe, panic-prone, clone, empty guards).
+    pub rust: bool,
+    /// Run frontend (TS/JS) rules (subscribe leaks, empty catch, console, …).
+    pub frontend: bool,
+    /// Rule ids to switch off individually, overriding the group toggles.
+    pub disable: Vec<String>,
+}
+
+impl Default for RulesConfig {
+    fn default() -> Self {
+        Self {
+            common: true,
+            rust: true,
+            frontend: true,
+            disable: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -132,6 +177,10 @@ impl Default for ReviewThresholds {
             max_function_params: 5,
             max_cyclomatic: 10,
             max_function_nesting: 4,
+            max_bool_operands: 4,
+            max_ternary_depth: 2,
+            max_as_casts: 3,
+            max_non_null_assertions: 2,
             max_unwrap_count: 2,
             max_expect_count: 2,
             max_panic_count: 0,

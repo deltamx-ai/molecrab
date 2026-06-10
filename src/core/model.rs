@@ -110,6 +110,52 @@ pub struct FunctionSnapshot {
     /// The files that reference this function, with per-file counts (the
     /// definition's own occurrence excluded). Sorted by count descending.
     pub referenced_by: Vec<FileReference>,
+    /// Extra structural signals extracted by the language layer, consumed by the
+    /// rule layer (`core::rules`). Defaults to all-zero; each language fills in
+    /// only what it can detect (e.g. `unsafe_count` is Rust-only, the bool/
+    /// ternary/subscribe signals are frontend-only).
+    pub signals: FunctionSignals,
+}
+
+/// Per-function structural signals beyond size/complexity, used by `core::rules`
+/// to drive lint-like rules. Populated by the language analyzers (`scanner.rs`
+/// for Rust, `frontend.rs` for TS/JS); fields a language cannot detect stay `0`/
+/// `false`, so under-reporting is the failure mode (never a false accusation).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct FunctionSignals {
+    /// `unsafe` blocks/items inside the function body (Rust).
+    pub unsafe_count: usize,
+    /// Empty control-flow bodies — empty `if`/`else` blocks and empty `catch`
+    /// clauses (both Rust and frontend, where detectable).
+    pub empty_blocks: usize,
+    /// `.subscribe(...)` call sites in the body (frontend / RxJS).
+    pub subscribe_calls: usize,
+    /// Whether the body shows any subscription cleanup
+    /// (`unsubscribe` / `takeUntil` / `Subscription` / `.add(`).
+    pub subscribe_cleanup: bool,
+    /// Longest `&&` / `||` operand chain in a single expression (frontend).
+    pub max_bool_chain: usize,
+    /// Deepest nesting of ternary (`?:`) expressions (frontend).
+    pub max_ternary_depth: usize,
+    /// `console.*` call sites in the body (frontend).
+    pub console_calls: usize,
+    /// `any` type annotations on the function (params / return / body) — the
+    /// classic TypeScript escape hatch (frontend, AST).
+    pub any_types: usize,
+    /// `x as T` type assertions in the body (frontend, AST).
+    pub as_casts: usize,
+    /// `x as unknown as T` double-cast chains — a strong "I'm overriding the
+    /// type system" smell (frontend, AST).
+    pub unknown_casts: usize,
+    /// `x!` non-null assertions in the body (frontend, AST).
+    pub non_null_assertions: usize,
+    /// `.then(...)` call sites (frontend, AST).
+    pub then_calls: usize,
+    /// `.catch(...)` call sites (frontend, AST).
+    pub catch_calls: usize,
+    /// `useEffect` / `useLayoutEffect` calls with no dependency array argument
+    /// (React, AST) — runs every render, a common bug source.
+    pub use_effect_missing_deps: usize,
 }
 
 /// A single file that references a function, and how many times.
@@ -203,6 +249,13 @@ pub struct Finding {
     /// Error handling / Complexity / Dead code / ...), distinct from `metric`
     /// (the scoring dimension). Derived from the finding when it is created.
     pub category: &'static str,
+    /// The rule that produced this finding (`core::rules`), e.g. `"unsafe-block"`.
+    /// `None` for structural findings raised directly by a metric and for
+    /// externally ingested lint findings.
+    pub rule: Option<&'static str>,
+    /// 1-based source line the finding points at, when known (the offending
+    /// function's location, or the line an external linter reported).
+    pub line: Option<usize>,
     pub message: String,
     pub suggestion: String,
     /// Points this finding deducted from its metric. Used as a magnitude signal
@@ -236,6 +289,7 @@ pub struct Priority {
     pub metric: &'static str,
     pub category: &'static str,
     pub file: Option<String>,
+    pub line: Option<usize>,
     pub message: String,
     pub suggestion: String,
 }
@@ -267,6 +321,9 @@ pub struct ReviewReport {
     pub scope: Option<ReviewScope>,
     pub metrics: Vec<MetricResult>,
     pub findings: Vec<Finding>,
+    /// Findings ingested from an external linter (ESLint). Surfaced in Issues /
+    /// Fix first but kept out of the metric scores.
+    pub lint_findings: Vec<Finding>,
     pub priorities: Vec<Priority>,
     pub areas: Vec<AreaHealth>,
     pub overall: u8,

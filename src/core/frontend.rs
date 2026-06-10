@@ -24,7 +24,9 @@ use swc_ecma_ast::*;
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
 use swc_ecma_visit::{Visit, VisitWith};
 
-use super::model::{FileSnapshot, FunctionSnapshot, ParamUsage, StylesheetSnapshot};
+use super::model::{
+    FileSnapshot, FunctionSignals, FunctionSnapshot, ParamUsage, StylesheetSnapshot,
+};
 
 // --------------------------------------------------------------------------
 // Public entry points
@@ -476,7 +478,8 @@ impl<'a> Collector<'a> {
         let pats: Vec<&Pat> = function.params.iter().map(|param| &param.pat).collect();
         let body = function.body.as_ref().map(BodyRef::Block);
         let (params, unused) = analyze_params(&pats, body);
-        let (cyclomatic, max_nesting) = complexity_of(body);
+        let type_anns = signature_types(&pats, function.return_type.as_deref());
+        let (cyclomatic, max_nesting, signals) = analyze_body(body, &type_anns);
         self.push(
             name,
             function.span,
@@ -485,6 +488,7 @@ impl<'a> Collector<'a> {
             unused,
             cyclomatic,
             max_nesting,
+            signals,
         );
         if let Some(body) = &function.body {
             self.collect_stmts(&body.stmts);
@@ -498,7 +502,8 @@ impl<'a> Collector<'a> {
             BlockStmtOrExpr::Expr(expr) => BodyRef::Expr(expr),
         };
         let (params, unused) = analyze_params(&pats, Some(body));
-        let (cyclomatic, max_nesting) = complexity_of(Some(body));
+        let type_anns = signature_types(&pats, arrow.return_type.as_deref());
+        let (cyclomatic, max_nesting, signals) = analyze_body(Some(body), &type_anns);
         self.push(
             name,
             arrow.span,
@@ -507,6 +512,7 @@ impl<'a> Collector<'a> {
             unused,
             cyclomatic,
             max_nesting,
+            signals,
         );
         match &*arrow.body {
             BlockStmtOrExpr::BlockStmt(block) => self.collect_stmts(&block.stmts),
@@ -528,7 +534,8 @@ impl<'a> Collector<'a> {
             .collect();
         let body = ctor.body.as_ref().map(BodyRef::Block);
         let (params, unused) = analyze_params(&pats, body);
-        let (cyclomatic, max_nesting) = complexity_of(body);
+        let type_anns = signature_types(&pats, None);
+        let (cyclomatic, max_nesting, signals) = analyze_body(body, &type_anns);
         self.push(
             name,
             ctor.span,
@@ -537,6 +544,7 @@ impl<'a> Collector<'a> {
             unused,
             cyclomatic,
             max_nesting,
+            signals,
         );
         if let Some(body) = &ctor.body {
             self.collect_stmts(&body.stmts);
@@ -553,6 +561,7 @@ impl<'a> Collector<'a> {
         unused_params: Vec<String>,
         cyclomatic: usize,
         max_nesting: usize,
+        signals: FunctionSignals,
     ) {
         let lo = self.cm.lookup_char_pos(span.lo());
         let hi = self.cm.lookup_char_pos(span.hi());
@@ -579,6 +588,7 @@ impl<'a> Collector<'a> {
             max_nesting,
             references: 0,
             referenced_by: Vec::new(),
+            signals,
         });
     }
 }
@@ -691,31 +701,74 @@ impl Visit for RefCounter<'_> {
 }
 
 // --------------------------------------------------------------------------
-// Complexity (cyclomatic + max nesting)
+// Body analysis (cyclomatic + max nesting + rule signals)
 // --------------------------------------------------------------------------
 
-/// Cyclomatic complexity (`1 + decision points`) and max control-flow nesting
-/// for one function body. Decision points: if / else-if / loops / switch cases
-/// / catch / ternary (boolean operators are intentionally not counted). Nested
+/// Analyzes one function body in a single pass: cyclomatic complexity
+/// (`1 + decision points`), max control-flow nesting, and the extra
+/// `FunctionSignals` the rule layer needs (empty guards, RxJS subscriptions,
+/// boolean-chain / ternary depth, console calls, plus the TS/React risk signals
+/// `any` / casts / non-null assertions / promise handling / effect deps).
+/// Decision points: if / else-if / loops / switch cases / catch / ternary
+/// (boolean operators are intentionally not counted toward complexity). Nested
 /// function bodies are excluded — each function is measured on its own.
-fn complexity_of(body: Option<BodyRef>) -> (usize, usize) {
-    let mut visitor = ComplexityVisitor::default();
+///
+/// `type_anns` are the function's parameter and return type annotations, scanned
+/// only so `any` in the signature (the most common spot) is counted too.
+fn analyze_body(body: Option<BodyRef>, type_anns: &[&TsType]) -> (usize, usize, FunctionSignals) {
+    let mut visitor = BodyVisitor::default();
     match body {
         Some(BodyRef::Block(block)) => block.visit_with(&mut visitor),
         Some(BodyRef::Expr(expr)) => expr.visit_with(&mut visitor),
         None => {}
     }
-    (visitor.decisions + 1, visitor.max_depth)
+    // Type annotations carry no control flow, so visiting them here only adds to
+    // the `any` count — complexity / nesting are unaffected.
+    for ty in type_anns {
+        ty.visit_with(&mut visitor);
+    }
+    let signals = FunctionSignals {
+        empty_blocks: visitor.empty_blocks,
+        subscribe_calls: visitor.subscribe_calls,
+        subscribe_cleanup: visitor.subscribe_cleanup,
+        max_bool_chain: visitor.max_bool_chain,
+        max_ternary_depth: visitor.max_ternary_depth,
+        console_calls: visitor.console_calls,
+        any_types: visitor.any_types,
+        as_casts: visitor.as_casts,
+        unknown_casts: visitor.unknown_casts,
+        non_null_assertions: visitor.non_null_assertions,
+        then_calls: visitor.then_calls,
+        catch_calls: visitor.catch_calls,
+        use_effect_missing_deps: visitor.use_effect_missing_deps,
+        // `unsafe` is a Rust concept; it never applies to a frontend function.
+        unsafe_count: 0,
+    };
+    (visitor.decisions + 1, visitor.max_depth, signals)
 }
 
 #[derive(Default)]
-struct ComplexityVisitor {
+struct BodyVisitor {
     decisions: usize,
     depth: usize,
     max_depth: usize,
+    empty_blocks: usize,
+    subscribe_calls: usize,
+    subscribe_cleanup: bool,
+    max_bool_chain: usize,
+    ternary_depth: usize,
+    max_ternary_depth: usize,
+    console_calls: usize,
+    any_types: usize,
+    as_casts: usize,
+    unknown_casts: usize,
+    non_null_assertions: usize,
+    then_calls: usize,
+    catch_calls: usize,
+    use_effect_missing_deps: usize,
 }
 
-impl ComplexityVisitor {
+impl BodyVisitor {
     fn nested<F: FnOnce(&mut Self)>(&mut self, body: F) {
         self.depth += 1;
         self.max_depth = self.max_depth.max(self.depth);
@@ -724,16 +777,73 @@ impl ComplexityVisitor {
     }
 }
 
-impl Visit for ComplexityVisitor {
+/// True if a statement is an empty block (`{}`), the shape of an empty guard.
+fn is_empty_block(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Block(block) if block.stmts.is_empty())
+}
+
+/// True if a type is exactly the `unknown` keyword — used to spot the
+/// `x as unknown as T` double-cast escape hatch.
+fn is_unknown_type(ty: &TsType) -> bool {
+    matches!(
+        ty,
+        TsType::TsKeywordType(k) if matches!(k.kind, TsKeywordTypeKind::TsUnknownKeyword)
+    )
+}
+
+/// Parameter + return type annotations for a function-like node, flattened so
+/// the body visitor can scan them for `any`.
+fn signature_types<'a>(pats: &[&'a Pat], return_type: Option<&'a TsTypeAnn>) -> Vec<&'a TsType> {
+    let mut types: Vec<&TsType> = pats.iter().filter_map(|pat| pat_type(pat)).collect();
+    if let Some(ann) = return_type {
+        types.push(ann.type_ann.as_ref());
+    }
+    types
+}
+
+/// The type annotation directly attached to a parameter pattern, if any.
+fn pat_type(pat: &Pat) -> Option<&TsType> {
+    let ann = match pat {
+        Pat::Ident(binding) => binding.type_ann.as_deref(),
+        Pat::Array(array) => array.type_ann.as_deref(),
+        Pat::Object(object) => object.type_ann.as_deref(),
+        Pat::Rest(rest) => rest.type_ann.as_deref(),
+        Pat::Assign(assign) => return pat_type(&assign.left),
+        _ => None,
+    };
+    ann.map(|ann| ann.type_ann.as_ref())
+}
+
+/// Number of leaf operands joined by `&&` / `||` in a single logical
+/// expression. `a && b && c` → 3. Non-logical expressions count as one operand,
+/// so the topmost logical node yields the full chain length.
+fn logical_operands(expr: &Expr) -> usize {
+    match expr {
+        Expr::Bin(bin) if matches!(bin.op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) => {
+            logical_operands(&bin.left) + logical_operands(&bin.right)
+        }
+        Expr::Paren(paren) => logical_operands(&paren.expr),
+        _ => 1,
+    }
+}
+impl Visit for BodyVisitor {
     fn visit_if_stmt(&mut self, node: &IfStmt) {
         self.decisions += 1;
+        if is_empty_block(&node.cons) {
+            self.empty_blocks += 1;
+        }
         node.test.visit_with(self);
         self.nested(|v| node.cons.visit_with(v));
         if let Some(alt) = &node.alt {
             match &**alt {
                 // `else if` is a flat chain, not deeper nesting.
                 Stmt::If(else_if) => self.visit_if_stmt(else_if),
-                other => self.nested(|v| other.visit_with(v)),
+                other => {
+                    if is_empty_block(other) {
+                        self.empty_blocks += 1;
+                    }
+                    self.nested(|v| other.visit_with(v));
+                }
             }
         }
     }
@@ -780,12 +890,91 @@ impl Visit for ComplexityVisitor {
 
     fn visit_catch_clause(&mut self, node: &CatchClause) {
         self.decisions += 1;
+        if node.body.stmts.is_empty() {
+            self.empty_blocks += 1;
+        }
         node.visit_children_with(self);
     }
 
     fn visit_cond_expr(&mut self, node: &CondExpr) {
         self.decisions += 1;
+        self.ternary_depth += 1;
+        self.max_ternary_depth = self.max_ternary_depth.max(self.ternary_depth);
         node.visit_children_with(self);
+        self.ternary_depth -= 1;
+    }
+
+    fn visit_bin_expr(&mut self, node: &BinExpr) {
+        if matches!(node.op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+            let operands = logical_operands(&node.left) + logical_operands(&node.right);
+            self.max_bool_chain = self.max_bool_chain.max(operands);
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        if let Callee::Expr(callee) = &node.callee {
+            match &**callee {
+                Expr::Member(member) => {
+                    if let MemberProp::Ident(prop) = &member.prop {
+                        match prop.sym.as_str() {
+                            "subscribe" => self.subscribe_calls += 1,
+                            "unsubscribe" | "add" => self.subscribe_cleanup = true,
+                            "then" => self.then_calls += 1,
+                            "catch" => self.catch_calls += 1,
+                            _ => {}
+                        }
+                    }
+                    if matches!(&*member.obj, Expr::Ident(obj) if obj.sym.as_str() == "console") {
+                        self.console_calls += 1;
+                    }
+                }
+                Expr::Ident(id) => {
+                    match id.sym.as_str() {
+                        "takeUntil" | "takeWhile" | "takeUntilDestroyed" => {
+                            self.subscribe_cleanup = true
+                        }
+                        // A React effect hook with no dependency-array argument
+                        // re-runs on every render — a frequent bug source.
+                        "useEffect" | "useLayoutEffect" if node.args.len() < 2 => {
+                            self.use_effect_missing_deps += 1
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_ts_keyword_type(&mut self, node: &TsKeywordType) {
+        if matches!(node.kind, TsKeywordTypeKind::TsAnyKeyword) {
+            self.any_types += 1;
+        }
+    }
+
+    fn visit_ts_as_expr(&mut self, node: &TsAsExpr) {
+        self.as_casts += 1;
+        // `x as unknown as T` parses as `(x as unknown) as T`; flag the inner
+        // `as unknown` as the dangerous double-cast.
+        if let Expr::TsAs(inner) = &*node.expr
+            && is_unknown_type(&inner.type_ann)
+        {
+            self.unknown_casts += 1;
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_ts_non_null_expr(&mut self, node: &TsNonNullExpr) {
+        self.non_null_assertions += 1;
+        node.visit_children_with(self);
+    }
+
+    fn visit_ident(&mut self, node: &Ident) {
+        if matches!(node.sym.as_str(), "Subscription" | "DestroyRef") {
+            self.subscribe_cleanup = true;
+        }
     }
 
     // Each function is measured on its own — do not descend into nested ones.
@@ -1112,5 +1301,99 @@ mod tests {
         let functions = scan_functions(&file("o.ts", src), src);
         let outer = function(&functions, "outer");
         assert_eq!(outer.cyclomatic, 1);
+    }
+
+    #[test]
+    fn flags_empty_catch_and_empty_if() {
+        let src = "function f(x: number) { if (x > 0) {} try { g(); } catch (e) {} }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        assert_eq!(f.signals.empty_blocks, 2);
+    }
+
+    #[test]
+    fn detects_subscribe_without_cleanup() {
+        let src = "function f() { obs$.subscribe(v => use(v)); }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        assert_eq!(f.signals.subscribe_calls, 1);
+        assert!(!f.signals.subscribe_cleanup);
+    }
+
+    #[test]
+    fn detects_subscribe_with_takeuntil_cleanup() {
+        let src = "function f() { obs$.pipe(takeUntil(this.destroy$)).subscribe(v => use(v)); }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        assert_eq!(f.signals.subscribe_calls, 1);
+        assert!(f.signals.subscribe_cleanup);
+    }
+
+    #[test]
+    fn measures_boolean_chain_and_ternary_depth() {
+        let src = "function f(a: boolean, b: boolean, c: boolean, d: boolean) { const x = a && b && c && d; return x ? (a ? 1 : 2) : 3; }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        assert_eq!(f.signals.max_bool_chain, 4);
+        assert_eq!(f.signals.max_ternary_depth, 2);
+    }
+
+    #[test]
+    fn counts_console_calls() {
+        let src = "function f() { console.log('a'); console.error('b'); }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        assert_eq!(f.signals.console_calls, 2);
+    }
+
+    #[test]
+    fn counts_any_in_params_return_and_body() {
+        let src = "function f(x: any): any { const y: any = x; return y; }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        // param `any` + return `any` + local `any`.
+        assert_eq!(f.signals.any_types, 3);
+    }
+
+    #[test]
+    fn detects_unknown_double_cast() {
+        let src = "function f(x: string) { return x as unknown as number; }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        assert_eq!(f.signals.as_casts, 2); // `as unknown` + `as number`
+        assert_eq!(f.signals.unknown_casts, 1);
+    }
+
+    #[test]
+    fn counts_non_null_assertions() {
+        let src = "function f(x?: string) { return x!.length + x!.charCodeAt(0); }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        assert_eq!(f.signals.non_null_assertions, 2);
+    }
+
+    #[test]
+    fn detects_then_without_catch() {
+        let src = "function f() { fetch('/x').then(r => r.json()); }";
+        let functions = scan_functions(&file("f.ts", src), src);
+        let f = function(&functions, "f");
+        assert_eq!(f.signals.then_calls, 1);
+        assert_eq!(f.signals.catch_calls, 0);
+    }
+
+    #[test]
+    fn detects_useeffect_without_deps() {
+        let src = "function C() { useEffect(() => { doThing(); }); }";
+        let functions = scan_functions(&file("C.tsx", src), src);
+        let c = function(&functions, "C");
+        assert_eq!(c.signals.use_effect_missing_deps, 1);
+    }
+
+    #[test]
+    fn useeffect_with_deps_is_not_flagged() {
+        let src = "function C() { useEffect(() => { doThing(); }, []); }";
+        let functions = scan_functions(&file("C.tsx", src), src);
+        let c = function(&functions, "C");
+        assert_eq!(c.signals.use_effect_missing_deps, 0);
     }
 }

@@ -7,7 +7,8 @@ pub fn run(command: Commands) -> i32 {
             config,
             format,
             since,
-        } => core::review::run(path, config, format, since),
+            eslint,
+        } => core::review::run(path, config, format, since, eslint),
         Commands::Doctor => {
             core::doctor::run();
             0

@@ -22,8 +22,9 @@ pub fn run(
     config_path: Option<PathBuf>,
     format: OutputFormat,
     since: Option<String>,
+    eslint: Option<PathBuf>,
 ) -> i32 {
-    match analyze(path, config_path, since) {
+    match analyze(path, config_path, since, eslint) {
         Ok(report) => {
             match format {
                 OutputFormat::Text => println!("{}", render_text_report(&report)),
@@ -48,11 +49,26 @@ pub fn analyze(
     path: PathBuf,
     config_path: Option<PathBuf>,
     since: Option<String>,
+    eslint: Option<PathBuf>,
 ) -> Result<ReviewReport, String> {
     let config = ReviewConfig::load_for_repository(&path, config_path.as_deref())?;
     let snapshot = scanner::scan_repository(&path, &config)?;
     let metric_results = metrics::evaluate(&snapshot, &config);
-    let mut report = build_report(&snapshot, config, metric_results);
+
+    let lint_findings = match eslint {
+        Some(report_path) => {
+            let json = std::fs::read_to_string(&report_path).map_err(|err| {
+                format!(
+                    "failed to read ESLint report {}: {err}",
+                    report_path.display()
+                )
+            })?;
+            super::lint::parse_eslint(&json, &path)?
+        }
+        None => Vec::new(),
+    };
+
+    let mut report = build_report(&snapshot, config, metric_results, lint_findings);
 
     if let Some(since) = since {
         let changed = scanner::changed_files(&path, &since).ok_or_else(|| {
@@ -69,8 +85,12 @@ fn build_report(
     snapshot: &RepositorySnapshot,
     config: ReviewConfig,
     metrics: Vec<MetricResult>,
+    lint_findings: Vec<Finding>,
 ) -> ReviewReport {
-    let findings = dedupe_findings(&metrics);
+    let mut findings = dedupe_findings(&metrics);
+    // External lint findings (ESLint) are surfaced alongside our own, but they
+    // never affect the metric scores — they ride in as extra issues only.
+    findings.extend(lint_findings.iter().cloned());
     let issue_categories = summarize_categories(&findings);
 
     // Honest score: the real weighted average, never floored upward. The
@@ -84,7 +104,7 @@ fn build_report(
         .min_by_key(|metric| metric.score)
         .map(|m| m.name);
 
-    let priorities = build_priorities(snapshot, &metrics, &config);
+    let priorities = build_priorities(snapshot, &metrics, &lint_findings, &config);
     let areas = build_areas(snapshot, &metrics);
 
     let categories = category_map(snapshot);
@@ -121,6 +141,7 @@ fn build_report(
         scope: None,
         metrics,
         findings,
+        lint_findings,
         priorities,
         areas,
         overall,
@@ -227,6 +248,9 @@ fn scope_report_to_diff(
         .findings
         .retain(|f| f.file.as_deref().is_some_and(in_scope));
     report
+        .lint_findings
+        .retain(|f| f.file.as_deref().is_some_and(in_scope));
+    report
         .priorities
         .retain(|p| p.file.as_deref().is_some_and(in_scope));
     report.issue_categories = summarize_categories(&report.findings);
@@ -323,23 +347,43 @@ fn severity_rank(severity: Severity) -> u8 {
 fn build_priorities(
     snapshot: &RepositorySnapshot,
     metrics: &[MetricResult],
+    lint_findings: &[Finding],
     config: &ReviewConfig,
 ) -> Vec<Priority> {
     let categories = category_map(snapshot);
     let mut priorities = Vec::new();
+    let metric_weight = |finding: &Finding| {
+        metrics
+            .iter()
+            .find(|metric| metric.name == finding.metric)
+            .map(|metric| metric.weight)
+            .unwrap_or(0)
+    };
+    let mut push = |finding: &Finding, weight: u8| {
+        priorities.push(Priority {
+            id: priority_id(finding),
+            impact: impact_of(finding, weight, &categories),
+            severity: finding.severity,
+            metric: finding.metric,
+            category: finding.category,
+            file: finding.file.clone(),
+            line: finding.line,
+            message: finding.message.clone(),
+            suggestion: finding.suggestion.clone(),
+        });
+    };
     for metric in metrics {
         for finding in &metric.findings {
-            priorities.push(Priority {
-                id: priority_id(finding),
-                impact: impact_of(finding, metric.weight, &categories),
-                severity: finding.severity,
-                metric: finding.metric,
-                category: finding.category,
-                file: finding.file.clone(),
-                message: finding.message.clone(),
-                suggestion: finding.suggestion.clone(),
-            });
+            push(finding, metric.weight);
         }
+    }
+    // Ingested lint findings are unscored, but still ranked into the list so a
+    // serious lint error can surface in "Fix first". Borrow the weight of the
+    // metric they are tagged with (lint findings reuse `metric = "robustness"`
+    // etc. is not guaranteed, so fall back to 0 when unknown).
+    for finding in lint_findings {
+        let weight = metric_weight(finding);
+        push(finding, weight);
     }
     priorities.sort_by(|a, b| b.impact.cmp(&a.impact).then_with(|| a.id.cmp(&b.id)));
     priorities.truncate(config.thresholds.top_priorities as usize);
@@ -725,6 +769,37 @@ fn to_function_ranking(func: &FunctionSnapshot, config: &ReviewConfig) -> Functi
     if !func.unused_params.is_empty() {
         flags.push("unused-param");
     }
+    if func.signals.unsafe_count > 0 {
+        flags.push("unsafe");
+    }
+    if func.signals.empty_blocks > 0 {
+        flags.push("empty-guard");
+    }
+    if func.signals.subscribe_calls > 0 && !func.signals.subscribe_cleanup {
+        flags.push("leak?");
+    }
+    if func.signals.max_bool_chain > config.thresholds.max_bool_operands as usize
+        || func.signals.max_ternary_depth > config.thresholds.max_ternary_depth as usize
+    {
+        flags.push("complex-expr");
+    }
+    if func.signals.any_types > 0 {
+        flags.push("any");
+    }
+    if func.signals.unknown_casts > 0
+        || func.signals.as_casts > config.thresholds.max_as_casts as usize
+    {
+        flags.push("cast!");
+    }
+    if func.signals.non_null_assertions > config.thresholds.max_non_null_assertions as usize {
+        flags.push("non-null!");
+    }
+    if func.signals.then_calls > 0 && func.signals.catch_calls == 0 {
+        flags.push("promise!");
+    }
+    if func.signals.use_effect_missing_deps > 0 {
+        flags.push("effect-deps");
+    }
 
     FunctionRanking {
         file: func.file.clone(),
@@ -922,11 +997,7 @@ fn render_fix_first(out: &mut String, report: &ReviewReport) {
     }
     heading(out, "Fix first");
     for (idx, priority) in report.priorities.iter().take(3).enumerate() {
-        let location = priority
-            .file
-            .as_deref()
-            .map(|file| file.cyan().to_string())
-            .unwrap_or_else(|| "repo-wide".dimmed().to_string());
+        let location = location_label(priority.file.as_deref(), priority.line);
         let _ = writeln!(
             out,
             "  {} {}  {}  {}",
@@ -937,6 +1008,15 @@ fn render_fix_first(out: &mut String, report: &ReviewReport) {
         );
     }
     let _ = writeln!(out);
+}
+
+/// Renders a `file:line` (or just `file`, or a dim `repo-wide`) location label.
+fn location_label(file: Option<&str>, line: Option<usize>) -> String {
+    match (file, line) {
+        (Some(file), Some(line)) => format!("{}:{}", file, line).cyan().to_string(),
+        (Some(file), None) => file.cyan().to_string(),
+        (None, _) => "repo-wide".dimmed().to_string(),
+    }
 }
 
 /// The reviewer's main view: problems grouped by category ("what kind of
@@ -966,11 +1046,7 @@ fn render_issues_by_category(out: &mut String, report: &ReviewReport) {
             format!("({})", category.count).dimmed()
         );
         for finding in items {
-            let location = finding
-                .file
-                .as_deref()
-                .map(|file| file.cyan().to_string())
-                .unwrap_or_else(|| "repo-wide".dimmed().to_string());
+            let location = location_label(finding.file.as_deref(), finding.line);
             let _ = writeln!(
                 out,
                 "    {}  {}",
@@ -1140,7 +1216,10 @@ fn render_notable_function(out: &mut String, func: &FunctionRanking) {
         .flags
         .iter()
         .map(|flag| {
-            if *flag == "dead?" {
+            if matches!(
+                *flag,
+                "dead?" | "unsafe" | "leak?" | "cast!" | "non-null!" | "promise!"
+            ) {
                 flag.red().bold().to_string()
             } else {
                 flag.yellow().to_string()
@@ -1328,7 +1407,7 @@ fn base_name(path: &str) -> &str {
 
 /// Version of the JSON report contract. Bump on any breaking shape change so
 /// service consumers can branch on it.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1339,7 +1418,24 @@ struct JsonReviewReport {
     areas: Vec<super::model::AreaHealth>,
     priorities: Vec<super::model::Priority>,
     metrics: Vec<super::model::MetricResult>,
+    /// The "safety / bug risk" view: the subset of findings whose category is a
+    /// correctness risk (Safety / Type safety / Error handling / Resource leak /
+    /// React / Angular), pulled out so service consumers can branch on risk
+    /// directly. These are the same findings already counted in the metrics.
+    safety_risks: Vec<Finding>,
+    /// Findings ingested from an external linter (ESLint). Kept separate from
+    /// metric findings because they do not affect the scores.
+    lint_findings: Vec<Finding>,
     observability: JsonObservability,
+}
+
+/// Reviewer categories that represent a correctness / safety risk (as opposed to
+/// style or structure). Drives the JSON `safety_risks` view.
+fn is_risk_category(category: &str) -> bool {
+    matches!(
+        category,
+        "Safety" | "Type safety" | "Error handling" | "Resource leak" | "React" | "Angular"
+    )
 }
 
 #[derive(Serialize)]
@@ -1394,6 +1490,13 @@ impl JsonReviewReport {
             areas: report.areas.clone(),
             priorities: report.priorities.clone(),
             metrics: report.metrics.clone(),
+            safety_risks: report
+                .findings
+                .iter()
+                .filter(|f| is_risk_category(f.category))
+                .cloned()
+                .collect(),
+            lint_findings: report.lint_findings.clone(),
             observability: JsonObservability {
                 function_summary: report.function_summary.clone(),
                 function_rankings: JsonFunctionRankings {
@@ -1413,7 +1516,9 @@ impl JsonReviewReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::{FunctionSnapshot, RepositoryProfile, RepositorySnapshot};
+    use crate::core::model::{
+        FunctionSignals, FunctionSnapshot, RepositoryProfile, RepositorySnapshot,
+    };
 
     fn func(
         name: &str,
@@ -1436,6 +1541,7 @@ mod tests {
             max_nesting: 0,
             references: 0,
             referenced_by: Vec::new(),
+            signals: FunctionSignals::default(),
         }
     }
 

@@ -32,6 +32,10 @@ pub enum Commands {
         /// Only review files changed since this git ref (e.g. `main`, `HEAD~1`).
         #[arg(long)]
         since: Option<String>,
+
+        /// Ingest an ESLint JSON report (`eslint -f json`) as findings.
+        #[arg(long)]
+        eslint: Option<PathBuf>,
     },
 
     /// Check whether common developer tools are installed and usable.

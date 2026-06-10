@@ -7,8 +7,8 @@ use super::classify;
 use super::config::ReviewConfig;
 use super::frontend;
 use super::model::{
-    FileReference, FileSnapshot, FunctionSnapshot, GitAuthorStat, GitHotspot, GitSnapshot,
-    RepositoryProfile, RepositorySnapshot, referenceable_fn_name,
+    FileReference, FileSnapshot, FunctionSignals, FunctionSnapshot, GitAuthorStat, GitHotspot,
+    GitSnapshot, RepositoryProfile, RepositorySnapshot, referenceable_fn_name,
 };
 
 /// Languages the scanner dispatches on. Rust is analyzed here (line based);
@@ -265,6 +265,7 @@ fn scan_rust_functions(file: &FileSnapshot, content: &str) -> Vec<FunctionSnapsh
             let end = find_function_end(&lines, i).unwrap_or(lines.len());
             let line_count = end.saturating_sub(start).max(1);
             let (cyclomatic, max_nesting) = rust_complexity(&lines[i..end]);
+            let signals = rust_signals(&lines[i..end]);
             functions.push(FunctionSnapshot {
                 file: file.path.clone(),
                 name,
@@ -281,6 +282,7 @@ fn scan_rust_functions(file: &FileSnapshot, content: &str) -> Vec<FunctionSnapsh
                 max_nesting,
                 references: 0,
                 referenced_by: Vec::new(),
+                signals,
             });
             i = end;
             continue;
@@ -483,6 +485,129 @@ fn rust_complexity(func_lines: &[&str]) -> (usize, usize) {
 
 fn is_branch_keyword(token: &str) -> bool {
     matches!(token, "if" | "for" | "while" | "loop")
+}
+
+/// Extra Rust signals for the rule layer, gathered from a function's source
+/// lines with the same token/brace approximation as `rust_complexity` (no real
+/// AST). Counts `unsafe` keywords and empty control-flow bodies. Frontend-only
+/// signals (bool chains, ternaries, subscriptions) are left at their defaults.
+///
+/// Comments and string/char literals are skipped, so the keyword scan only sees
+/// real code — in real Rust, `unsafe` is a reserved word, so every token it
+/// counts is genuine. Still approximate: a guard body is "the next `{ }` after
+/// an `if` / `else` / `while` / `for` / `loop` / `match`", so a struct literal
+/// inside a condition can occasionally be miscounted.
+fn rust_signals(func_lines: &[&str]) -> FunctionSignals {
+    let chars: Vec<char> = func_lines.join("\n").chars().collect();
+    let n = chars.len();
+    let mut unsafe_count = 0usize;
+    let mut empty_blocks = 0usize;
+    let mut token = String::new();
+    let mut guard_armed = false;
+
+    // Resolves the just-finished identifier token (called whenever it ends — at
+    // punctuation, whitespace, or the start of a comment / literal).
+    let flush = |token: &mut String, unsafe_count: &mut usize, guard_armed: &mut bool| {
+        match token.as_str() {
+            "unsafe" => *unsafe_count += 1,
+            "if" | "else" | "while" | "for" | "loop" | "match" => *guard_armed = true,
+            _ => {}
+        }
+        token.clear();
+    };
+
+    let mut i = 0;
+    while i < n {
+        let ch = chars[i];
+
+        // ---- skip comments and literals (their contents are not code) ----
+        if ch == '/' && chars.get(i + 1) == Some(&'/') {
+            flush(&mut token, &mut unsafe_count, &mut guard_armed);
+            i += 2;
+            while i < n && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && chars.get(i + 1) == Some(&'*') {
+            flush(&mut token, &mut unsafe_count, &mut guard_armed);
+            i += 2;
+            let mut depth = 1usize; // Rust block comments nest.
+            while i < n && depth > 0 {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if ch == '"' {
+            flush(&mut token, &mut unsafe_count, &mut guard_armed);
+            i += 1;
+            while i < n {
+                match chars[i] {
+                    '\\' => i += 2,
+                    '"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            continue;
+        }
+        if ch == '\'' {
+            // A char literal (`'x'`, `'\n'`) — but a lifetime (`'a`) is just a
+            // tick, so only skip when it really closes like a char literal.
+            flush(&mut token, &mut unsafe_count, &mut guard_armed);
+            if chars.get(i + 1) == Some(&'\\') {
+                i += 2;
+                while i < n && chars[i] != '\'' {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            if chars.get(i + 2) == Some(&'\'') {
+                i += 3;
+                continue;
+            }
+            i += 1; // lifetime tick
+            continue;
+        }
+
+        if ch == '_' || ch.is_alphanumeric() {
+            token.push(ch);
+            i += 1;
+            continue;
+        }
+
+        flush(&mut token, &mut unsafe_count, &mut guard_armed);
+
+        if ch == '{' && guard_armed {
+            let mut j = i + 1;
+            while j < n && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'}') {
+                empty_blocks += 1;
+            }
+            guard_armed = false;
+        }
+        i += 1;
+    }
+    flush(&mut token, &mut unsafe_count, &mut guard_armed);
+
+    FunctionSignals {
+        unsafe_count,
+        empty_blocks,
+        ..FunctionSignals::default()
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -711,6 +836,23 @@ mod tests {
             "fn f(x: i32) -> i32 {\n    match x {\n        0 => 1,\n        _ => 2,\n    }\n}\n";
         let functions = scan_rust_functions(&rust_file(src), src);
         assert_eq!(functions[0].cyclomatic, 3);
+    }
+
+    #[test]
+    fn extracts_unsafe_and_empty_guard_signals() {
+        let src = "fn f(p: *const u8) {\n    if p.is_null() {}\n    unsafe { let _ = *p; }\n}\n";
+        let functions = scan_rust_functions(&rust_file(src), src);
+        let signals = &functions[0].signals;
+        assert_eq!(signals.unsafe_count, 1);
+        assert_eq!(signals.empty_blocks, 1);
+    }
+
+    #[test]
+    fn empty_function_body_is_not_an_empty_guard() {
+        let src = "fn noop() {}\n";
+        let functions = scan_rust_functions(&rust_file(src), src);
+        assert_eq!(functions[0].signals.empty_blocks, 0);
+        assert_eq!(functions[0].signals.unsafe_count, 0);
     }
 
     #[test]

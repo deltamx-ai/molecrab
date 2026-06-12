@@ -9,4 +9,5 @@ pub mod metrics;
 pub mod model;
 pub mod review;
 pub mod rules;
+pub mod rust;
 pub mod scanner;

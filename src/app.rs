@@ -32,7 +32,7 @@ fn review(
     let report = match core::review::analyze(path, config, since, eslint) {
         Ok(report) => report,
         Err(err) => {
-            eprintln!("review failed: {}", err.red());
+            eprintln!("review failed: {}", err.to_string().red());
             return 1;
         }
     };

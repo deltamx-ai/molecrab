@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use super::classify::FileCategory;
 use super::config::ReviewConfig;
+use super::error::ReviewError;
 use super::metrics;
 use super::model::{
     AreaHealth, CategoryCount, FileRanking, Finding, FunctionRanking, FunctionSnapshot,
@@ -17,20 +18,21 @@ pub fn analyze(
     config_path: Option<PathBuf>,
     since: Option<String>,
     eslint: Option<PathBuf>,
-) -> Result<ReviewReport, String> {
-    let config = ReviewConfig::load_for_repository(&path, config_path.as_deref())?;
-    let snapshot = scanner::scan_repository(&path, &config)?;
+) -> Result<ReviewReport, ReviewError> {
+    let config = ReviewConfig::load_for_repository(&path, config_path.as_deref())
+        .map_err(ReviewError::Config)?;
+    let snapshot = scanner::scan_repository(&path, &config).map_err(ReviewError::Io)?;
     let metric_results = metrics::evaluate(&snapshot, &config);
 
     let lint_findings = match eslint {
         Some(report_path) => {
             let json = std::fs::read_to_string(&report_path).map_err(|err| {
-                format!(
+                ReviewError::Io(format!(
                     "failed to read ESLint report {}: {err}",
                     report_path.display()
-                )
+                ))
             })?;
-            super::lint::parse_eslint(&json, &path)?
+            super::lint::parse_eslint(&json, &path).map_err(ReviewError::Lint)?
         }
         None => Vec::new(),
     };
@@ -39,7 +41,9 @@ pub fn analyze(
 
     if let Some(since) = since {
         let changed = scanner::changed_files(&path, &since).ok_or_else(|| {
-            format!("cannot diff against '{since}' — not a git repository or unknown ref")
+            ReviewError::Git(format!(
+                "cannot diff against '{since}' — not a git repository or unknown ref"
+            ))
         })?;
         let changed: HashSet<String> = changed.into_iter().collect();
         scope_report_to_diff(&mut report, &snapshot, &since, &changed);

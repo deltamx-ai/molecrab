@@ -1068,7 +1068,10 @@ fn rule_angular_template_binding(
 
     let mut hits = Vec::new();
     for file in &snapshot.files {
-        if !file.name.ends_with(".html") || file.category.is_noise() {
+        // `.html` files classify as `Other` (not source), so we do not filter on
+        // category here — the sibling-component requirement below is what keeps
+        // this from matching stray templates.
+        if !file.name.ends_with(".html") {
             continue;
         }
         let Some(html) = file.content.as_deref() else {

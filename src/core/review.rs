@@ -1,11 +1,10 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::PathBuf;
 
 use colored::{ColoredString, Colorize};
 use serde::Serialize;
-
-use crate::cli::OutputFormat;
 
 use super::classify::FileCategory;
 use super::config::ReviewConfig;
@@ -17,34 +16,6 @@ use super::model::{
     is_dead_code_candidate,
 };
 use super::scanner;
-
-pub fn run(
-    path: PathBuf,
-    config_path: Option<PathBuf>,
-    format: OutputFormat,
-    since: Option<String>,
-    eslint: Option<PathBuf>,
-) -> i32 {
-    match analyze(path, config_path, since, eslint) {
-        Ok(report) => {
-            match format {
-                OutputFormat::Text => println!("{}", render_text_report(&report)),
-                OutputFormat::Json => match render_json_report(&report) {
-                    Ok(json) => println!("{}", json),
-                    Err(err) => {
-                        eprintln!("review failed: {}", err.red());
-                        return 1;
-                    }
-                },
-            }
-            0
-        }
-        Err(err) => {
-            eprintln!("review failed: {}", err.red());
-            1
-        }
-    }
-}
 
 pub fn analyze(
     path: PathBuf,
@@ -585,12 +556,25 @@ fn grade_for(score: u8) -> &'static str {
     }
 }
 
+/// Sorts `items` by `cmp` and keeps the top `limit` (an empty result when
+/// `limit == 0`). The single home for the "rank then cap" pattern every
+/// `rank_*` evidence list shares.
+fn top_n<T>(mut items: Vec<T>, limit: usize, cmp: impl FnMut(&T, &T) -> Ordering) -> Vec<T> {
+    items.sort_by(cmp);
+    if limit == 0 {
+        items.clear();
+    } else {
+        items.truncate(limit);
+    }
+    items
+}
+
 fn rank_files(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Vec<FileRanking> {
     if !config.observability.longest_file_ranking {
         return Vec::new();
     }
 
-    let mut files = snapshot
+    let files = snapshot
         .files
         .iter()
         .filter(|file| file.is_first_party_code())
@@ -603,14 +587,11 @@ fn rank_files(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Vec<FileR
         })
         .collect::<Vec<_>>();
 
-    files.sort_by(|a, b| b.lines.cmp(&a.lines).then_with(|| b.bytes.cmp(&a.bytes)));
-    let limit = config.thresholds.top_file_rankings as usize;
-    if limit == 0 {
-        files.clear();
-    } else {
-        files.truncate(limit);
-    }
-    files
+    top_n(
+        files,
+        config.thresholds.top_file_rankings as usize,
+        |a, b| b.lines.cmp(&a.lines).then_with(|| b.bytes.cmp(&a.bytes)),
+    )
 }
 
 /// Evidence: the longest functions. (The aggregate health lives in
@@ -620,26 +601,23 @@ fn rank_functions(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Vec<F
         return Vec::new();
     }
 
-    let mut functions = snapshot
+    let functions = snapshot
         .functions
         .iter()
         .filter(|func| func.lines >= config.thresholds.min_function_lines_for_rank as usize)
         .map(|func| to_function_ranking(func, config))
         .collect::<Vec<_>>();
 
-    functions.sort_by(|a, b| {
-        b.lines
-            .cmp(&a.lines)
-            .then_with(|| b.param_count.cmp(&a.param_count))
-            .then_with(|| a.file.cmp(&b.file))
-    });
-    let limit = config.thresholds.top_function_rankings as usize;
-    if limit == 0 {
-        functions.clear();
-    } else {
-        functions.truncate(limit);
-    }
-    functions
+    top_n(
+        functions,
+        config.thresholds.top_function_rankings as usize,
+        |a, b| {
+            b.lines
+                .cmp(&a.lines)
+                .then_with(|| b.param_count.cmp(&a.param_count))
+                .then_with(|| a.file.cmp(&b.file))
+        },
+    )
 }
 
 /// Ranks functions that have at least one unused parameter, surfacing them even
@@ -652,27 +630,24 @@ fn rank_param_hygiene(
         return Vec::new();
     }
 
-    let mut functions = snapshot
+    let functions = snapshot
         .functions
         .iter()
         .filter(|func| !func.unused_params.is_empty())
         .map(|func| to_function_ranking(func, config))
         .collect::<Vec<_>>();
 
-    functions.sort_by(|a, b| {
-        b.unused_params
-            .len()
-            .cmp(&a.unused_params.len())
-            .then_with(|| b.param_count.cmp(&a.param_count))
-            .then_with(|| a.file.cmp(&b.file))
-    });
-    let limit = config.thresholds.top_function_rankings as usize;
-    if limit == 0 {
-        functions.clear();
-    } else {
-        functions.truncate(limit);
-    }
-    functions
+    top_n(
+        functions,
+        config.thresholds.top_function_rankings as usize,
+        |a, b| {
+            b.unused_params
+                .len()
+                .cmp(&a.unused_params.len())
+                .then_with(|| b.param_count.cmp(&a.param_count))
+                .then_with(|| a.file.cmp(&b.file))
+        },
+    )
 }
 
 /// Evidence: functions that look like possible dead code (named, first-party
@@ -684,18 +659,15 @@ fn rank_dead_code(
     if !config.observability.longest_function_ranking {
         return Vec::new();
     }
-    let mut functions: Vec<FunctionRanking> = unreferenced
+    let functions: Vec<FunctionRanking> = unreferenced
         .iter()
         .map(|&func| to_function_ranking(func, config))
         .collect();
-    functions.sort_by(|a, b| b.lines.cmp(&a.lines).then_with(|| a.file.cmp(&b.file)));
-    let limit = config.thresholds.top_function_rankings as usize;
-    if limit == 0 {
-        functions.clear();
-    } else {
-        functions.truncate(limit);
-    }
-    functions
+    top_n(
+        functions,
+        config.thresholds.top_function_rankings as usize,
+        |a, b| b.lines.cmp(&a.lines).then_with(|| a.file.cmp(&b.file)),
+    )
 }
 
 /// Evidence: the most complex functions, by cyclomatic complexity.
@@ -703,25 +675,22 @@ fn rank_most_complex(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Ve
     if !config.observability.longest_function_ranking {
         return Vec::new();
     }
-    let mut functions: Vec<FunctionRanking> = snapshot
+    let functions: Vec<FunctionRanking> = snapshot
         .functions
         .iter()
         .filter(|func| func.cyclomatic > 1)
         .map(|func| to_function_ranking(func, config))
         .collect();
-    functions.sort_by(|a, b| {
-        b.cyclomatic
-            .cmp(&a.cyclomatic)
-            .then_with(|| b.max_nesting.cmp(&a.max_nesting))
-            .then_with(|| a.file.cmp(&b.file))
-    });
-    let limit = config.thresholds.top_function_rankings as usize;
-    if limit == 0 {
-        functions.clear();
-    } else {
-        functions.truncate(limit);
-    }
-    functions
+    top_n(
+        functions,
+        config.thresholds.top_function_rankings as usize,
+        |a, b| {
+            b.cyclomatic
+                .cmp(&a.cyclomatic)
+                .then_with(|| b.max_nesting.cmp(&a.max_nesting))
+                .then_with(|| a.file.cmp(&b.file))
+        },
+    )
 }
 
 /// Evidence for the compact text report: the functions worth a look, each shown
@@ -736,7 +705,7 @@ fn rank_notable_functions(
     if !config.observability.longest_function_ranking {
         return Vec::new();
     }
-    let mut rows: Vec<FunctionRanking> = snapshot
+    let rows: Vec<FunctionRanking> = snapshot
         .functions
         .iter()
         .map(|func| {
@@ -748,18 +717,15 @@ fn rank_notable_functions(
         })
         .filter(|ranking| !ranking.flags.is_empty())
         .collect();
-    rows.sort_by(|a, b| {
-        notable_concern(b)
-            .cmp(&notable_concern(a))
-            .then_with(|| a.file.cmp(&b.file))
-    });
-    let limit = config.thresholds.top_function_rankings as usize;
-    if limit == 0 {
-        rows.clear();
-    } else {
-        rows.truncate(limit);
-    }
-    rows
+    top_n(
+        rows,
+        config.thresholds.top_function_rankings as usize,
+        |a, b| {
+            notable_concern(b)
+                .cmp(&notable_concern(a))
+                .then_with(|| a.file.cmp(&b.file))
+        },
+    )
 }
 
 fn notable_concern(ranking: &FunctionRanking) -> usize {
@@ -852,7 +818,7 @@ fn rank_stylesheets(
         return Vec::new();
     }
 
-    let mut stylesheets = snapshot
+    let stylesheets = snapshot
         .stylesheets
         .iter()
         .map(|sheet| StylesheetRanking {
@@ -873,20 +839,17 @@ fn rank_stylesheets(
         .collect::<Vec<_>>();
 
     // Longest stylesheets first, then the heaviest single rule, then nesting.
-    stylesheets.sort_by(|a, b| {
-        b.lines
-            .cmp(&a.lines)
-            .then_with(|| b.largest_rule_lines.cmp(&a.largest_rule_lines))
-            .then_with(|| b.max_nesting_depth.cmp(&a.max_nesting_depth))
-            .then_with(|| a.file.cmp(&b.file))
-    });
-    let limit = config.thresholds.top_stylesheet_rankings as usize;
-    if limit == 0 {
-        stylesheets.clear();
-    } else {
-        stylesheets.truncate(limit);
-    }
-    stylesheets
+    top_n(
+        stylesheets,
+        config.thresholds.top_stylesheet_rankings as usize,
+        |a, b| {
+            b.lines
+                .cmp(&a.lines)
+                .then_with(|| b.largest_rule_lines.cmp(&a.largest_rule_lines))
+                .then_with(|| b.max_nesting_depth.cmp(&a.max_nesting_depth))
+                .then_with(|| a.file.cmp(&b.file))
+        },
+    )
 }
 
 // --------------------------------------------------------------------------
@@ -899,7 +862,7 @@ fn rank_stylesheets(
 // duplicate "Findings" section.
 // --------------------------------------------------------------------------
 
-fn render_text_report(report: &ReviewReport) -> String {
+pub(crate) fn render_text_report(report: &ReviewReport) -> String {
     let mut out = String::new();
     render_summary(&mut out, report);
     render_fix_first(&mut out, report);
@@ -912,7 +875,7 @@ fn render_text_report(report: &ReviewReport) -> String {
     out
 }
 
-fn render_json_report(report: &ReviewReport) -> Result<String, String> {
+pub(crate) fn render_json_report(report: &ReviewReport) -> Result<String, String> {
     let output = JsonReviewReport::from_report(report);
     serde_json::to_string_pretty(&output)
         .map_err(|err| format!("failed to render json report: {}", err))

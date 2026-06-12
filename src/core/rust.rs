@@ -366,6 +366,103 @@ fn rust_signals(func_lines: &[&str]) -> FunctionSignals {
     }
 }
 
+/// Returns `content` with the interior of line/block comments and string/char
+/// literals replaced by spaces (newlines preserved). Pattern scans for
+/// `unwrap(` / `.clone()` / `panic!(` etc. run over this so a match inside a
+/// comment or a string literal is not miscounted as real code — the same
+/// reason `rust_signals` is comment/string aware.
+pub(crate) fn strip_noise(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(n);
+    let blank = |out: &mut String, ch: char| out.push(if ch == '\n' { '\n' } else { ' ' });
+
+    let mut i = 0;
+    while i < n {
+        let ch = chars[i];
+        if ch == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < n && chars[i] != '\n' {
+                blank(&mut out, chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && chars.get(i + 1) == Some(&'*') {
+            let mut depth = 1usize;
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            while i < n && depth > 0 {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                } else {
+                    blank(&mut out, chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if ch == '"' {
+            out.push(' ');
+            i += 1;
+            while i < n {
+                match chars[i] {
+                    '\\' => {
+                        out.push(' ');
+                        out.push(' ');
+                        i += 2;
+                    }
+                    '"' => {
+                        out.push(' ');
+                        i += 1;
+                        break;
+                    }
+                    other => {
+                        blank(&mut out, other);
+                        i += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        if ch == '\'' {
+            // Char literal (`'x'` / `'\n'`); a lifetime (`'a`) is just a tick.
+            if chars.get(i + 1) == Some(&'\\') {
+                out.push(' ');
+                i += 1;
+                while i < n && chars[i] != '\'' {
+                    out.push(' ');
+                    i += 1;
+                }
+                if i < n {
+                    out.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+            if chars.get(i + 2) == Some(&'\'') {
+                out.push_str("   ");
+                i += 3;
+                continue;
+            }
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,5 +551,18 @@ mod tests {
         let functions = scan_rust_functions(&rust_file(src), src);
         assert_eq!(functions[0].signals.empty_blocks, 0);
         assert_eq!(functions[0].signals.unsafe_count, 0);
+    }
+
+    #[test]
+    fn strip_noise_blanks_comments_and_strings() {
+        // `unwrap(` appears in a line comment, a block comment, and a string —
+        // none should survive; the real call should.
+        let src = "let x = y.unwrap(); // call unwrap() here\n\
+                   /* unwrap() in block */\n\
+                   let s = \"unwrap() in string\";\n";
+        let stripped = strip_noise(src);
+        assert_eq!(stripped.matches("unwrap(").count(), 1);
+        // Line structure is preserved so offsets stay sane.
+        assert_eq!(stripped.lines().count(), src.lines().count());
     }
 }

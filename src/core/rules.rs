@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 
 use super::config::ReviewConfig;
-use super::metrics::{is_rust_source, is_source, max_source_line_length, scan_pattern};
+use super::metrics::{is_source, max_source_line_length, scan_pattern, scan_rust_pattern};
 use super::model::{
     Finding, FunctionSnapshot, RepositorySnapshot, Severity, is_dead_code_candidate,
 };
@@ -652,7 +652,7 @@ fn rule_panic_prone(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Vec
     ];
     let mut hits = Vec::new();
     for (needle, weight, label, limit) in patterns {
-        let (count, offender) = scan_pattern(snapshot, needle, is_rust_source);
+        let (count, offender) = scan_rust_pattern(snapshot, needle);
         if count == 0 || (limit > 0 && count <= limit) {
             continue;
         }
@@ -690,7 +690,7 @@ fn rule_unsafe_block(snapshot: &RepositorySnapshot, _config: &ReviewConfig) -> V
 
 fn rule_excessive_clone(snapshot: &RepositorySnapshot, config: &ReviewConfig) -> Vec<RuleHit> {
     let max = config.thresholds.max_clone_count as usize;
-    let (count, offender) = scan_pattern(snapshot, ".clone()", is_rust_source);
+    let (count, offender) = scan_rust_pattern(snapshot, ".clone()");
     if count <= max {
         return Vec::new();
     }

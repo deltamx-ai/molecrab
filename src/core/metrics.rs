@@ -370,6 +370,35 @@ where
     (total, top.map(|(path, _)| path))
 }
 
+/// Like [`scan_pattern`] but restricted to Rust source and run over a
+/// comment/string-stripped copy of each file, so panic-prone patterns
+/// (`unwrap(`, `panic!(`, `.clone()`, …) inside comments or string literals are
+/// not miscounted as real code.
+pub(crate) fn scan_rust_pattern(
+    snapshot: &RepositorySnapshot,
+    needle: &str,
+) -> (usize, Option<String>) {
+    let mut total = 0usize;
+    let mut top: Option<(String, usize)> = None;
+    for file in &snapshot.files {
+        if !is_rust_source(file) {
+            continue;
+        }
+        let Some(content) = file.content.as_deref() else {
+            continue;
+        };
+        let count = super::rust::strip_noise(content).matches(needle).count();
+        if count == 0 {
+            continue;
+        }
+        total += count;
+        if top.as_ref().is_none_or(|(_, best)| count > *best) {
+            top = Some((file.path.clone(), count));
+        }
+    }
+    (total, top.map(|(path, _)| path))
+}
+
 pub(crate) fn max_source_line_length(snapshot: &RepositorySnapshot) -> Option<(String, usize)> {
     snapshot
         .files

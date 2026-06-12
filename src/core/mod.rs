@@ -1,6 +1,7 @@
 pub mod classify;
 pub mod config;
 pub mod doctor;
+pub mod error;
 pub mod frontend;
 pub mod frontend_profile;
 pub mod lint;
@@ -8,4 +9,5 @@ pub mod metrics;
 pub mod model;
 pub mod review;
 pub mod rules;
+pub mod rust;
 pub mod scanner;
